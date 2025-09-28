@@ -2400,15 +2400,8 @@ class InfoTab(QWidget):
 
         # Security Status Section (simplified)
         security_layout = self.security_group.layout()
-        try:
-            # Basic firewall check for macOS
-            import subprocess
-            result = subprocess.run(['sudo', '-n', '/usr/libexec/ApplicationFirewall/socketfilterfw', '--getglobalstate'], 
-                                  capture_output=True, text=True, timeout=5)
-            firewall_status = "Active" if "enabled" in result.stdout.lower() else "Inactive"
-        except:
-            firewall_status = "Unknown"
-        
+        firewall_status = self._detect_firewall_status()
+
         security_layout.addRow(self._bold("Firewall:"), self._value_label(firewall_status))
         security_layout.addRow(self._bold("Updates:"), self._value_label("Check System Preferences"))
 
@@ -2444,6 +2437,109 @@ class InfoTab(QWidget):
             f"font-size: 16px; font-weight: 600; color: {APP_COLORS['text_primary']};"
         )
         return l
+
+    def _detect_firewall_status(self) -> str:
+        system = platform.system()
+
+        detector_chain = []
+
+        if system == "Darwin":
+            detector_chain.extend([
+                (["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], self._parse_macos_socketfilterfw),
+                (["/usr/bin/defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate"], self._parse_macos_defaults)
+            ])
+        elif system == "Windows":
+            detector_chain.extend([
+                (["powershell", "-NoProfile", "-Command", "(Get-NetFirewallProfile | Where-Object {$_.Enabled -eq 1}).Enabled"], self._parse_windows_powershell_firewall),
+                (["netsh", "advfirewall", "show", "allprofiles"], self._parse_windows_netsh_firewall)
+            ])
+        else:  # Linux / Other Unix
+            detector_chain.extend([
+                (["/usr/sbin/ufw", "status"], self._parse_linux_ufw),
+                (["/usr/bin/firewall-cmd", "--state"], self._parse_linux_firewalld)
+            ])
+
+        for command, parser in detector_chain:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False
+                )
+                parsed = parser(result)
+                if parsed:
+                    return parsed
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+
+        return "Unknown"
+
+    @staticmethod
+    def _parse_macos_socketfilterfw(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        output = result.stdout.lower()
+        if "enabled" in output:
+            return "Active"
+        if "disabled" in output:
+            return "Inactive"
+        return None
+
+    @staticmethod
+    def _parse_macos_defaults(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        mapping = {
+            "0": "Inactive",
+            "1": "Active",
+            "2": "Block all"
+        }
+        return mapping.get(value)
+
+    @staticmethod
+    def _parse_windows_powershell_firewall(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        output = result.stdout.strip()
+        if not output:
+            return None
+        return "Active" if any(token.lower() == "true" or token == "1" for token in output.split()) else "Inactive"
+
+    @staticmethod
+    def _parse_windows_netsh_firewall(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        output = result.stdout.lower()
+        if "state" not in output:
+            return None
+        return "Active" if "state on" in output or "enabled" in output else "Inactive"
+
+    @staticmethod
+    def _parse_linux_ufw(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        output = result.stdout.lower()
+        if "inactive" in output:
+            return "Inactive"
+        if "active" in output:
+            return "Active"
+        return None
+
+    @staticmethod
+    def _parse_linux_firewalld(result: subprocess.CompletedProcess) -> Optional[str]:
+        if result.returncode != 0:
+            return None
+        output = result.stdout.strip().lower()
+        if output == "running":
+            return "Active"
+        if output == "not running":
+            return "Inactive"
+        return None
 
     def _apply_theme(self):
         self.setStyleSheet(
