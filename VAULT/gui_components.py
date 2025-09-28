@@ -10,8 +10,6 @@ from typing import Optional
 from datetime import datetime
 from PySide6.QtCore import QObject, Signal, QThread, Qt, QDateTime, QSize
 from PySide6.QtGui import QFont, QIcon, QColor
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 from metadata_worker import MetadataWorker
 import uuid
 import subprocess
@@ -268,12 +266,6 @@ class HomeTab(QWidget):
 
                 self.drive_container_layout.addWidget(disk_card)
         
-        def _create_text_battery(self, percentage_str: str) -> str:
-            # This method is no longer used for visualization, but kept for potential debugging/legacy
-            percentage = float(percentage_str.replace('%', ''))
-            blocks = int(percentage // 10)
-            return f"[{'#' * blocks}{'-' * (10 - blocks)}] {percentage:.1f}%"
-
         def _update_system_summary(self):
             os_info = self.system_info_collector.get_os_info()
             cpu_info = self.system_info_collector.get_cpu_info()
