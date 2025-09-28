@@ -22,7 +22,6 @@ VAULT is a comprehensive, enterprise-grade system designed for **secure data pur
 - [API Reference](#api-reference)
 - [Security Considerations](#security-considerations)
 - [Contributing](#contributing)
-- [License](#license)
 
 ---
 
@@ -354,18 +353,6 @@ python -m pytest tests/test_content_analyzer.py
 # Run with coverage
 python -m pytest --cov=src tests/
 ```
-
----
-
-## License
-
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
-
-### Third-Party Licenses
-- **PySide6**: LGPL-3.0 License
-- **spaCy**: MIT License
-- **PyTorch**: BSD-3-Clause License
-- **ReportLab**: BSD-3-Clause License
 
 ---
 
