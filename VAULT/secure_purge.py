@@ -4082,32 +4082,41 @@ class WipeOrchestratorMCP:
             if path_obj.exists():
                 if path_obj.is_file():
                     stat_info = path_obj.stat()
+                    permissions = oct(stat_info.st_mode)[-3:]  # Extract permissions
                     return {
                         "Type": "File",
                         "Size": f"{stat_info.st_size:,} bytes",
                         "Last_Modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
-                        "Permissions": oct(stat_info.st_mode)[-3:],
+                        "Permissions": permissions,
+                        "permissions": permissions,  # Django backend expects lowercase
                         "Inode": stat_info.st_ino
                     }
                 elif path_obj.is_dir():
                     file_count = sum(1 for _ in path_obj.rglob('*') if _.is_file())
+                    permissions = oct(path_obj.stat().st_mode)[-3:]
                     return {
                         "Type": "Directory",
                         "File_Count": file_count,
                         "Last_Modified": datetime.fromtimestamp(path_obj.stat().st_mtime).isoformat(),
-                        "Permissions": oct(path_obj.stat().st_mode)[-3:]
+                        "Permissions": permissions,
+                        "permissions": permissions,  # Django backend expects lowercase
                     }
             else:
+                # For block devices, provide default permissions
                 return {
                     "Type": "Block Device",
                     "Status": "Physical device detected",
-                    "Analysis": "Block-level device requiring low-level wiping"
+                    "Analysis": "Block-level device requiring low-level wiping",
+                    "Permissions": "600",  # Default for block devices
+                    "permissions": "600"   # Django backend expects lowercase
                 }
         except Exception as e:
             return {
                 "Type": "Unknown",
                 "Error": str(e),
-                "Status": "Analysis failed"
+                "Status": "Analysis failed",
+                "Permissions": "000",  # Default for unknown/error cases
+                "permissions": "000"   # Django backend expects lowercase
             }
     
     def _assess_security_risk(self, target_path: str) -> dict:
@@ -4137,13 +4146,16 @@ class WipeOrchestratorMCP:
                 "Verification_Status": "PASSED",
                 "Target_Accessibility": "Not Accessible (Expected)",
                 "Data_Recovery_Test": "No recoverable data found",
-                "Filesystem_Check": "Target completely removed"
+                "Filesystem_Check": "Target completely removed",
+                "Recommendation": "Wipe operation completed successfully - no further action required",
+                "recommendation": "Wipe operation completed successfully - no further action required"  # Django backend expects lowercase
             }
         else:
             return {
                 "Verification_Status": "WARNING",
                 "Target_Accessibility": "Still Accessible",
-                "Recommendation": "Manual verification required"
+                "Recommendation": "Manual verification required - target still exists after wipe",
+                "recommendation": "Manual verification required - target still exists after wipe"  # Django backend expects lowercase
             }
     
     def _get_security_confirmation(self, target_path: str) -> dict:
