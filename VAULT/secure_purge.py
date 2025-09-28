@@ -1148,6 +1148,7 @@ def generate_refurbish_report_pdf(out_path: Path, report_data: dict,):
 class SystemInfoCollector:
     def __init__(self, logger: ConsoleLogger = None):
         self.logger = logger if logger else ConsoleLogger() # Use provided logger or default to ConsoleLogger
+        self._cpu_brand_cache: Optional[str] = None
 
     def get_os_info(self):
         base = {
@@ -1160,6 +1161,11 @@ class SystemInfoCollector:
             "Platform": platform.platform() or "Unknown"
         }
 
+        if not base.get("Processor") or str(base.get("Processor")).strip().lower() in {"", "unknown"}:
+            cpu_brand = self._get_cpu_brand()
+            if cpu_brand:
+                base["Processor"] = cpu_brand
+
         # Duplicate keys in normalized forms so downstream lookups succeed regardless of casing
         normalized = {k.lower(): v for k, v in base.items()}
         snake = {k.replace(" ", "_").lower(): v for k, v in base.items()}
@@ -1170,21 +1176,112 @@ class SystemInfoCollector:
     def get_cpu_info(self):
         try:
             cpu_freq = psutil.cpu_freq()
-            freq_str = f"{cpu_freq.current:.2f} Mhz" if cpu_freq else "N/A"
-            return {
-                "Physical Cores": psutil.cpu_count(logical=False) or "N/A",
-                "Total Cores": psutil.cpu_count(logical=True) or "N/A",
+            freq_str = f"{cpu_freq.current:.2f} MHz" if cpu_freq else "N/A"
+            max_freq = f"{cpu_freq.max:.2f} MHz" if cpu_freq and cpu_freq.max else None
+
+            cpu_brand = self._get_cpu_brand() or platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER")
+            architecture = platform.machine() or "Unknown"
+
+            physical_cores = psutil.cpu_count(logical=False)
+            logical_cores = psutil.cpu_count(logical=True)
+            usage_percent = psutil.cpu_percent(interval=0.1)
+
+            info = {
+                "Brand": cpu_brand or "Unknown",
+                "Processor": cpu_brand or platform.processor() or "Unknown",
+                "Architecture": architecture or "Unknown",
+                "Physical Cores": physical_cores if physical_cores else "N/A",
+                "Total Cores": logical_cores if logical_cores else "N/A",
                 "Current Frequency": freq_str,
-                "Total Usage": f"{psutil.cpu_percent(interval=0.1)}%"
+                "Total Usage": f"{usage_percent:.1f}%"
             }
+
+            if max_freq:
+                info["Max Frequency"] = max_freq
+
+            return info
         except Exception as e:
             self.logger.log(f"Error getting CPU info: {e}")
             return {
+                "Brand": "Unknown",
+                "Processor": "Unknown",
+                "Architecture": platform.machine() or "Unknown",
                 "Physical Cores": "N/A",
                 "Total Cores": "N/A", 
                 "Current Frequency": "N/A",
                 "Total Usage": "N/A"
             }
+
+    def _get_cpu_brand(self) -> Optional[str]:
+        if self._cpu_brand_cache:
+            return self._cpu_brand_cache
+
+        brand: Optional[str] = None
+
+        try:
+            import cpuinfo  # type: ignore
+
+            cpuinfo_data = cpuinfo.get_cpu_info()  # type: ignore[attr-defined]
+            brand = cpuinfo_data.get("brand_raw") or cpuinfo_data.get("brand")
+        except Exception:
+            pass
+
+        system = platform.system()
+
+        if not brand and system == "Darwin":
+            try:
+                result = subprocess.run(
+                    ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False
+                )
+                if result.returncode == 0:
+                    candidate = result.stdout.strip()
+                    if candidate:
+                        brand = candidate
+            except Exception:
+                pass
+
+        if not brand and system == "Windows":
+            try:
+                result = subprocess.run(
+                    ["wmic", "cpu", "get", "name"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    shell=True,
+                    check=False
+                )
+                if result.returncode == 0:
+                    lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and line.strip().lower() != "name"]
+                    if lines:
+                        brand = lines[0]
+            except Exception:
+                pass
+
+        if not brand and system == "Linux":
+            try:
+                with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as cpuinfo_file:
+                    for line in cpuinfo_file:
+                        if line.lower().startswith("model name"):
+                            brand = line.split(":", 1)[1].strip()
+                            if brand:
+                                break
+            except Exception:
+                pass
+
+        if not brand:
+            brand = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER") or None
+
+        if brand:
+            cleaned = brand.strip()
+            if cleaned:
+                self._cpu_brand_cache = cleaned
+                return cleaned
+
+        return None
 
     def get_memory_info(self):
         try:
@@ -1609,76 +1706,283 @@ class SystemInfoCollector:
         info = {
             "System Serial Number": "N/A",
             "Chip / Processor Name": "N/A",
-            "Hardware UUID": "N/A" # Added for macOS
+            "Hardware UUID": "N/A"
         }
-        if platform.system() == "Darwin":  # macOS
-            try:
-                # Use system_profiler for comprehensive hardware data
-                command = ["system_profiler", "SPHardwareDataType", "-json"]
-                process = subprocess.run(command, capture_output=True, text=True, check=True)
-                hardware_data = json.loads(process.stdout)
-                
-                if hardware_data and "SPHardwareDataType" in hardware_data and hardware_data["SPHardwareDataType"]:
-                    hw_info = hardware_data["SPHardwareDataType"][0]
-                    info["System Serial Number"] = hw_info.get("serial_number", "N/A")
-                    info["Chip / Processor Name"] = hw_info.get("chip_type", hw_info.get("cpu_type", "N/A"))
-                    info["Hardware UUID"] = hw_info.get("hardware_uuid", "N/A")
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-macOS] Error getting detailed hardware info: {e}")
-                import traceback
-                traceback.print_exc()
-        elif platform.system() == "Windows":
-            try:
-                # Get serial number
-                serial_command = ["wmic", "bios", "get", "serialnumber"]
-                serial_process = subprocess.run(serial_command, capture_output=True, text=True, check=True, shell=True)
-                serial_output = serial_process.stdout.strip().split('\n')
-                if len(serial_output) > 1: # Skip header
-                    info["System Serial Number"] = serial_output[1].strip()
-                
-                # Get CPU name
-                cpu_command = ["wmic", "cpu", "get", "name"]
-                cpu_process = subprocess.run(cpu_command, capture_output=True, text=True, check=True, shell=True)
-                cpu_output = cpu_process.stdout.strip().split('\n')
-                if len(cpu_output) > 1: # Skip header
-                    info["Chip / Processor Name"] = cpu_output[1].strip()
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-Windows] Error getting detailed hardware info: {e}")
-                import traceback
-                traceback.print_exc()
-        elif platform.system() == "Linux":
-            try:
-                # Try to get serial number (requires dmidecode, may need sudo)
-                try:
-                    serial_command = ["sudo", "dmidecode", "-s", "system-serial-number"]
-                    serial_process = subprocess.run(serial_command, capture_output=True, text=True, check=True, timeout=10)
-                    info["System Serial Number"] = serial_process.stdout.strip()
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-                    # Fallback: try without sudo or use alternative methods
-                    try:
-                        serial_command = ["dmidecode", "-s", "system-serial-number"]
-                        serial_process = subprocess.run(serial_command, capture_output=True, text=True, check=True, timeout=10)
-                        info["System Serial Number"] = serial_process.stdout.strip()
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-                        # Try reading from /sys filesystem
-                        try:
-                            with open('/sys/class/dmi/id/product_serial', 'r') as f:
-                                info["System Serial Number"] = f.read().strip()
-                        except (FileNotFoundError, PermissionError):
-                            info["System Serial Number"] = "N/A (requires root access)"
-                
-                # Get CPU name
-                cpu_command = ["lscpu"]
-                cpu_process = subprocess.run(cpu_command, capture_output=True, text=True, check=True)
-                for line in cpu_process.stdout.splitlines():
-                    if "Model name:" in line:
-                        info["Chip / Processor Name"] = line.split(":", 1)[1].strip()
-                        break
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-Linux] Error getting detailed hardware info: {e}")
-                import traceback
-                traceback.print_exc()
+
+        system = platform.system()
+
+        if system == "Darwin":
+            collected = self._collect_macos_hardware_info()
+        elif system == "Windows":
+            collected = self._collect_windows_hardware_info()
+        elif system == "Linux":
+            collected = self._collect_linux_hardware_info()
+        else:
+            collected = {}
+
+        for key, value in collected.items():
+            sanitized = self._sanitize_identifier(value)
+            if sanitized:
+                info[key] = sanitized
+
+        if info["Chip / Processor Name"] in {"N/A", None}:
+            fallback_chip = self._get_cpu_brand() or platform.processor()
+            if fallback_chip:
+                info["Chip / Processor Name"] = fallback_chip
+
+        for key, value in info.items():
+            if not value or str(value).strip() == "":
+                info[key] = "N/A"
+
         return info
+
+    def _collect_macos_hardware_info(self) -> Dict[str, Optional[str]]:
+        payload: Dict[str, Optional[str]] = {
+            "System Serial Number": None,
+            "Chip / Processor Name": None,
+            "Hardware UUID": None
+        }
+
+        try:
+            command = ["system_profiler", "SPHardwareDataType", "-json"]
+            process = subprocess.run(command, capture_output=True, text=True, check=True, timeout=8)
+            hardware_data = json.loads(process.stdout)
+
+            if hardware_data and hardware_data.get("SPHardwareDataType"):
+                hw_info = hardware_data["SPHardwareDataType"][0]
+                payload["System Serial Number"] = hw_info.get("serial_number") or hw_info.get("serialnumber")
+                payload["Chip / Processor Name"] = hw_info.get("chip_type") or hw_info.get("cpu_type")
+                payload["Hardware UUID"] = hw_info.get("hardware_uuid") or hw_info.get("platform_uuid")
+        except Exception as exc:
+            self.logger.log(f"[ERROR-SIC-macOS] system_profiler failed: {exc}")
+
+        try:
+            if not self._sanitize_identifier(payload.get("System Serial Number")):
+                ioreg_serial = self._run_command_capture_first_line(
+                    ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                    timeout=5
+                )
+                if ioreg_serial:
+                    serial_match = re.search(r'"IOPlatformSerialNumber"\s*=\s*"([^"]+)"', ioreg_serial)
+                    if not serial_match:
+                        serial_match = re.search(r'IOPlatformSerialNumber\"\s*=\s*\"([^\"]+)\"', ioreg_serial)
+                    if serial_match:
+                        payload["System Serial Number"] = serial_match.group(1)
+
+            if not self._sanitize_identifier(payload.get("Hardware UUID")):
+                ioreg_uuid_output = subprocess.run(
+                    ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False
+                ).stdout
+                uuid_match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', ioreg_uuid_output)
+                if uuid_match:
+                    payload["Hardware UUID"] = uuid_match.group(1)
+        except Exception as exc:
+            self.logger.log(f"[WARN-SIC-macOS] ioreg fallback failed: {exc}")
+
+        return payload
+
+    def _collect_windows_hardware_info(self) -> Dict[str, Optional[str]]:
+        payload: Dict[str, Optional[str]] = {
+            "System Serial Number": None,
+            "Chip / Processor Name": None,
+            "Hardware UUID": None
+        }
+
+        try:
+            payload["System Serial Number"] = self._run_command_capture_first_line(
+                ["wmic", "bios", "get", "serialnumber"],
+                expected_headers={"serialnumber", "serial number"},
+                shell=True
+            )
+
+            if not self._sanitize_identifier(payload.get("System Serial Number")):
+                payload["System Serial Number"] = self._run_command_capture_first_line(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-CimInstance Win32_BIOS).SerialNumber"
+                    ],
+                    expected_headers=set()
+                )
+        except Exception as exc:
+            self.logger.log(f"[WARN-SIC-Windows] Serial detection failed: {exc}")
+
+        try:
+            payload["Hardware UUID"] = self._run_command_capture_first_line(
+                ["wmic", "csproduct", "get", "UUID"],
+                expected_headers={"uuid"},
+                shell=True
+            )
+
+            if not self._sanitize_identifier(payload.get("Hardware UUID")):
+                payload["Hardware UUID"] = self._run_command_capture_first_line(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-CimInstance Win32_ComputerSystemProduct).UUID"
+                    ],
+                    expected_headers=set()
+                )
+        except Exception as exc:
+            self.logger.log(f"[WARN-SIC-Windows] Hardware UUID detection failed: {exc}")
+
+        try:
+            payload["Chip / Processor Name"] = self._run_command_capture_first_line(
+                ["wmic", "cpu", "get", "name"],
+                expected_headers={"name"},
+                shell=True
+            )
+        except Exception as exc:
+            self.logger.log(f"[WARN-SIC-Windows] CPU name detection failed: {exc}")
+
+        return payload
+
+    def _collect_linux_hardware_info(self) -> Dict[str, Optional[str]]:
+        payload: Dict[str, Optional[str]] = {
+            "System Serial Number": None,
+            "Chip / Processor Name": None,
+            "Hardware UUID": None
+        }
+
+        serial_paths = [
+            Path("/sys/class/dmi/id/product_serial"),
+            Path("/sys/devices/virtual/dmi/id/product_serial"),
+            Path("/sys/devices/virtual/dmi/id/board_serial")
+        ]
+
+        for serial_path in serial_paths:
+            try:
+                if serial_path.exists():
+                    candidate = serial_path.read_text(encoding="utf-8", errors="ignore").strip()
+                    if self._sanitize_identifier(candidate):
+                        payload["System Serial Number"] = candidate
+                        break
+            except Exception:
+                continue
+
+        if not self._sanitize_identifier(payload.get("System Serial Number")):
+            try:
+                payload["System Serial Number"] = self._run_command_capture_first_line(
+                    ["dmidecode", "-s", "system-serial-number"],
+                    timeout=6
+                )
+            except Exception:
+                pass
+
+        uuid_paths = [
+            Path("/sys/class/dmi/id/product_uuid"),
+            Path("/sys/devices/virtual/dmi/id/product_uuid"),
+            Path("/etc/machine-id")
+        ]
+
+        for uuid_path in uuid_paths:
+            try:
+                if uuid_path.exists():
+                    candidate = uuid_path.read_text(encoding="utf-8", errors="ignore").strip()
+                    if self._sanitize_identifier(candidate):
+                        payload["Hardware UUID"] = candidate
+                        break
+            except Exception:
+                continue
+
+        if not self._sanitize_identifier(payload.get("Hardware UUID")):
+            try:
+                payload["Hardware UUID"] = self._run_command_capture_first_line(
+                    ["dmidecode", "-s", "system-uuid"],
+                    timeout=6
+                )
+            except Exception:
+                pass
+
+        try:
+            cpu_process = subprocess.run(["lscpu"], capture_output=True, text=True, check=False, timeout=5)
+            if cpu_process.stdout:
+                for line in cpu_process.stdout.splitlines():
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        if key.strip().lower() in {"model name", "modelname"}:
+                            payload["Chip / Processor Name"] = value.strip()
+                            break
+        except Exception:
+            pass
+
+        if not self._sanitize_identifier(payload.get("Chip / Processor Name")):
+            try:
+                with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as cpuinfo_file:
+                    for line in cpuinfo_file:
+                        if line.lower().startswith("model name"):
+                            payload["Chip / Processor Name"] = line.split(":", 1)[1].strip()
+                            break
+            except Exception:
+                pass
+
+        return payload
+
+    @staticmethod
+    def _sanitize_identifier(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        invalid_tokens = {
+            "unknown",
+            "n/a",
+            "na",
+            "none",
+            "",
+            "to be filled by o.e.m.",
+            "to be filled by o.e.m",
+            "not specified",
+            "default string",
+            "system serial number"
+        }
+        if lowered in invalid_tokens:
+            return None
+        return cleaned
+
+    def _run_command_capture_first_line(
+        self,
+        command: List[str],
+        *,
+        expected_headers: Optional[set] = None,
+        shell: bool = False,
+        timeout: int = 5
+    ) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                command if shell else command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                shell=shell
+            )
+        except Exception as exc:
+            self.logger.log(f"[DEBUG-SIC] Command {' '.join(command)} failed: {exc}")
+            return None
+
+        output = result.stdout if result.stdout is not None else ""
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if not lines:
+            return None
+
+        if expected_headers:
+            filtered = [line for line in lines if line.lower() not in expected_headers]
+        else:
+            filtered = lines
+
+        if not filtered:
+            return None
+
+        return filtered[0]
 
     def get_physical_disks(self, include_disk_images=False):
         disks = []
