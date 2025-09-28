@@ -17,6 +17,14 @@ import multiprocessing as mp
 from queue import Empty
 import traceback
 
+# Import API client for sending wipe certificates to Django backend
+try:
+    from api_client import auto_send_wipe_certificate
+except ImportError:
+    # Fallback if api_client is not available
+    def auto_send_wipe_certificate(*args, **kwargs):
+        return {"success": False, "message": "API client not available"}
+
 # Configure module-level logger
 logging.basicConfig(
     level=logging.INFO,
@@ -4291,6 +4299,40 @@ class WipeOrchestratorMCP:
 
         self.gui_logger.log(f"[MCP] Certificates generated. Wipe ID: {certificate_id}. Check model_artifacts folder.")
         self.gui_logger.log(f"[MCP] Verification URL: https://verify.example.org/certs/{certificate_id}")
+        
+        # Automatically send wipe certificate to Django backend API
+        self._send_certificate_to_backend(certificate_id)
+    
+    def _send_certificate_to_backend(self, certificate_id: str):
+        """
+        Automatically send the wipe certificate to the Django backend API.
+        
+        Args:
+            certificate_id: The certificate ID to send
+        """
+        try:
+            # Django backend API endpoint
+            api_endpoint = "https://commercial-website-8a8m.onrender.com/api/wipe-certificates/"
+            
+            # Send the certificate
+            result = auto_send_wipe_certificate(
+                certificate_id=certificate_id,
+                model_artifacts_dir=MODEL_ARTIFACT_DIR,
+                api_endpoint=api_endpoint,
+                gui_logger=self.gui_logger
+            )
+            
+            if result["success"]:
+                self.gui_logger.log("[MCP-API] ✓ Wipe certificate successfully sent to backend")
+                if "response" in result and result["response"]:
+                    self.gui_logger.log(f"[MCP-API] Server response: {result['response']}")
+            else:
+                self.gui_logger.log(f"[MCP-API] ✗ Failed to send certificate: {result['message']}")
+                
+        except Exception as e:
+            error_msg = f"[MCP-API] Unexpected error sending certificate: {str(e)}"
+            self.gui_logger.log(error_msg)
+            self._mcp_log(error_msg)
 
 def hash_file(path: Path) -> str:
     h = hashlib.sha256()
