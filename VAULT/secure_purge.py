@@ -1142,15 +1142,22 @@ class SystemInfoCollector:
         self.logger = logger if logger else ConsoleLogger() # Use provided logger or default to ConsoleLogger
 
     def get_os_info(self):
-        return {
-            "System": platform.system(),
-            "Node Name": platform.node(),
-            "Release": platform.release(),
-            "Version": platform.version(),
-            "Machine": platform.machine(),
-            "Processor": platform.processor(),
-            "Platform": platform.platform()
+        base = {
+            "System": platform.system() or "Unknown",
+            "Node Name": platform.node() or "Unknown",
+            "Release": platform.release() or "Unknown",
+            "Version": platform.version() or "Unknown",
+            "Machine": platform.machine() or "Unknown",
+            "Processor": platform.processor() or "Unknown",
+            "Platform": platform.platform() or "Unknown"
         }
+
+        # Duplicate keys in normalized forms so downstream lookups succeed regardless of casing
+        normalized = {k.lower(): v for k, v in base.items()}
+        snake = {k.replace(" ", "_").lower(): v for k, v in base.items()}
+        base.update(normalized)
+        base.update(snake)
+        return base
 
     def get_cpu_info(self):
         try:
@@ -1208,173 +1215,386 @@ class SystemInfoCollector:
         return partitions
 
     def get_battery_info(self):
+        system = platform.system()
+        payload: Dict[str, Any] = {}
+
+        try:
+            if system == "Darwin":
+                payload = self._collect_battery_info_macos()
+            elif system == "Windows":
+                payload = self._collect_battery_info_windows()
+            elif system == "Linux":
+                payload = self._collect_battery_info_linux()
+        except Exception as exc:
+            self.logger.log(f"[ERROR-SIC] Battery collector failed on {system}: {exc}")
+
+        # Fallback to psutil if dedicated collectors failed or no battery detected
+        if not payload.get("has_battery"):
+            try:
+                battery = psutil.sensors_battery()
+                if battery:
+                    payload.update({
+                        "has_battery": True,
+                        "percent": battery.percent,
+                        "charge_status": "charging" if battery.power_plugged else "discharging",
+                        "time_remaining_minutes": None if battery.secsleft in (psutil.POWER_TIME_UNKNOWN, None) else max(battery.secsleft / 60, 0),
+                        "cycle_count": getattr(battery, "cycle_count", payload.get("cycle_count")),
+                    })
+            except Exception as exc:
+                self.logger.log(f"[ERROR-SIC] psutil battery fallback failed: {exc}")
+
+        return self._finalize_battery_payload(payload)
+
+    # --- Battery helper collectors -------------------------------------------------
+
+    @staticmethod
+    def _extract_number(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        match = re.search(r"([-+]?[0-9]*\.?[0-9]+)", str(raw))
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+        return None
+
+    def _collect_battery_info_macos(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"has_battery": False}
+        try:
+            command = ["system_profiler", "SPPowerDataType", "-json"]
+            process = subprocess.run(command, capture_output=True, text=True, check=True)
+            data = json.loads(process.stdout)
+            power_data = data.get("SPPowerDataType", [])
+            if not power_data:
+                return payload
+
+            battery_entry = None
+            for entry in power_data:
+                if "sppower_battery_data_type" in entry and entry["sppower_battery_data_type"]:
+                    battery_entry = entry["sppower_battery_data_type"][0]
+                    break
+                # Some versions expose fields directly on the top-level entry
+                battery_keys = {k.lower() for k in entry.keys()}
+                if any(key in battery_keys for key in ["current capacity", "state of charge (%)", "full charge capacity"]):
+                    battery_entry = entry
+                    break
+
+            if not battery_entry:
+                return payload
+
+            payload["has_battery"] = True
+
+            def get_field(*names):
+                for name in names:
+                    if name in battery_entry:
+                        return battery_entry[name]
+                return None
+
+            condition_info = get_field("Battery Condition", "Condition", "battery_health")
+            payload["condition"] = condition_info
+
+            current_capacity = self._extract_number(get_field("Current Capacity", "CurrentCapacity", "current_capacity"))
+            max_capacity = self._extract_number(get_field("Max Capacity", "Full Charge Capacity", "MaxCapacity", "max_capacity"))
+            design_capacity = self._extract_number(get_field("Design Capacity", "DesignCapacity", "design_capacity"))
+
+            if current_capacity is not None and max_capacity not in (None, 0):
+                payload["percent"] = (current_capacity / max_capacity) * 100.0
+            else:
+                state_pct = self._extract_number(get_field("State of Charge (%)", "sppower_state_of_charge"))
+                if state_pct is not None:
+                    payload["percent"] = state_pct
+
+            payload["cycle_count"] = get_field("Cycle Count", "CycleCount", "cycle_count")
+            payload["design_capacity_mwh"] = design_capacity * 1000 if isinstance(design_capacity, (int, float)) else None
+            payload["full_charge_capacity_mwh"] = max_capacity * 1000 if isinstance(max_capacity, (int, float)) else None
+            payload["remaining_capacity_mwh"] = current_capacity * 1000 if isinstance(current_capacity, (int, float)) else None
+            payload["design_capacity_mah"] = design_capacity
+            payload["full_charge_capacity_mah"] = max_capacity
+            payload["current_capacity_mah"] = current_capacity
+            payload["manufacturer"] = get_field("Manufacturer", "manufacturer")
+            payload["serial_number"] = get_field("Serial Number", "SerialNumber", "serial_number")
+
+            charging_state = get_field("Charging", "Is Charging", "charging")
+            if isinstance(charging_state, str):
+                payload["charge_status"] = charging_state.lower()
+            elif isinstance(charging_state, bool):
+                payload["charge_status"] = "yes" if charging_state else "no"
+
+            voltage = self._extract_number(get_field("Voltage", "voltage"))
+            if voltage:
+                payload["voltage_mv"] = voltage * 1000 if voltage < 150 else voltage
+
+            temperature_raw = self._extract_number(get_field("Temperature", "temperature"))
+            if temperature_raw is not None:
+                candidate = temperature_raw
+                if candidate > 200:  # many mac sensors report in 0.1°C
+                    candidate = candidate / 100.0
+                if -40 <= candidate <= 120:
+                    payload["temperature_c"] = candidate
+
+            time_remaining = get_field("Time Remaining", "time_remaining")
+            if isinstance(time_remaining, dict):
+                minutes = time_remaining.get("_duration")
+                if minutes is not None and minutes >= 0:
+                    payload["time_remaining_minutes"] = minutes
+            elif isinstance(time_remaining, (int, float)) and time_remaining >= 0:
+                payload["time_remaining_minutes"] = time_remaining
+
+            battery_installed = get_field("Battery Installed", "battery_installed")
+            if isinstance(battery_installed, str) and battery_installed.lower() in {"no", "false"}:
+                payload["has_battery"] = False
+
+            if not payload.get("cycle_count"):
+                try:
+                    ioreg_cmd = ["ioreg", "-rn", "AppleSmartBattery", "-a"]
+                    ioreg_proc = subprocess.run(ioreg_cmd, capture_output=True, check=True)
+                    ioreg_data = plistlib.loads(ioreg_proc.stdout)
+                    if ioreg_data:
+                        fallback_cycle = ioreg_data[0].get("CycleCount")
+                        if fallback_cycle is not None:
+                            payload["cycle_count"] = fallback_cycle
+                except Exception as exc:
+                    self.logger.log(f"[WARN-SIC-macOS] Cycle count fallback failed: {exc}")
+
+        except Exception as exc:
+            self.logger.log(f"[ERROR-SIC-macOS] Error collecting battery info: {exc}")
+
+        return payload
+
+    def _collect_battery_info_windows(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"has_battery": False}
+        try:
+            command = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance -ClassName Win32_Battery | ConvertTo-Json"
+            ]
+            process = subprocess.run(command, capture_output=True, text=True, check=True, shell=False)
+            output = process.stdout.strip()
+            if not output:
+                return payload
+
+            data = json.loads(output)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+
+            if not data:
+                return payload
+
+            payload["has_battery"] = True
+            payload["percent"] = self._extract_number(data.get("EstimatedChargeRemaining"))
+            payload["cycle_count"] = data.get("CycleCount")
+            payload["design_capacity_mwh"] = self._extract_number(data.get("DesignCapacity"))
+            payload["full_charge_capacity_mwh"] = self._extract_number(data.get("FullChargeCapacity"))
+            payload["remaining_capacity_mwh"] = self._extract_number(data.get("FullChargeCapacity"))  # Approximate when current not available
+            payload["voltage_mv"] = self._extract_number(data.get("Voltage"))
+            payload["temperature_c"] = self._extract_number(data.get("Temperature"))
+
+            status_code = str(data.get("BatteryStatus", ""))
+            batt_status_map = {
+                "1": "discharging",
+                "2": "charging",
+                "3": "fully-charged",
+                "4": "low",
+                "5": "critical",
+                "6": "charging",
+                "7": "charging",
+                "8": "partially-charged",
+                "9": "unknown",
+                "10": "unknown"
+            }
+            payload["charge_status"] = batt_status_map.get(status_code, "unknown")
+
+            if not payload.get("cycle_count"):
+                try:
+                    cycle_command = [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "$cycle = Get-CimInstance -Namespace root\\wmi -Class BatteryCycleCount; if ($cycle -and $cycle.CycleCount -ge 0) { $cycle.CycleCount }"
+                    ]
+                    cycle_proc = subprocess.run(cycle_command, capture_output=True, text=True, check=True, shell=False)
+                    cycle_output = cycle_proc.stdout.strip()
+                    if cycle_output:
+                        payload["cycle_count"] = self._extract_number(cycle_output)
+                except Exception as exc:
+                    self.logger.log(f"[WARN-SIC-Windows] Cycle count fallback failed: {exc}")
+        except Exception as exc:
+            self.logger.log(f"[ERROR-SIC-Windows] Error collecting battery info: {exc}")
+
+        return payload
+
+    def _collect_battery_info_linux(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"has_battery": False}
+        base_path = Path("/sys/class/power_supply")
+        if not base_path.exists():
+            return payload
+
+        for device in base_path.iterdir():
+            try:
+                if not device.is_dir():
+                    continue
+                type_path = device / "type"
+                if not type_path.exists():
+                    continue
+                if type_path.read_text().strip().lower() != "battery":
+                    continue
+
+                payload["has_battery"] = True
+                data_files = {p.name: p.read_text().strip() for p in device.iterdir() if p.is_file()}
+
+                payload["percent"] = self._extract_number(data_files.get("capacity"))
+                payload["cycle_count"] = self._extract_number(data_files.get("cycle_count"))
+                payload["voltage_mv"] = self._extract_number(data_files.get("voltage_now"))
+                payload["temperature_c"] = self._extract_number(data_files.get("temp"))
+                if payload.get("temperature_c") is not None:
+                    payload["temperature_c"] = payload["temperature_c"] / 10.0 if payload["temperature_c"] > 200 else payload["temperature_c"]
+
+                # Prefer energy values; fallback to charge values (convert uWh to mWh)
+                energy_design = self._extract_number(data_files.get("energy_full_design"))
+                if energy_design is None:
+                    energy_design = self._extract_number(data_files.get("charge_full_design"))
+                if energy_design is not None:
+                    payload["design_capacity_mwh"] = energy_design / 1000.0 if energy_design > 1000 else energy_design
+
+                energy_full = self._extract_number(data_files.get("energy_full"))
+                if energy_full is None:
+                    energy_full = self._extract_number(data_files.get("charge_full"))
+                if energy_full is not None:
+                    payload["full_charge_capacity_mwh"] = energy_full / 1000.0 if energy_full > 1000 else energy_full
+
+                energy_now = self._extract_number(data_files.get("energy_now"))
+                if energy_now is None:
+                    energy_now = self._extract_number(data_files.get("charge_now"))
+                if energy_now is not None:
+                    payload["remaining_capacity_mwh"] = energy_now / 1000.0 if energy_now > 1000 else energy_now
+
+                status = data_files.get("status", "unknown").lower()
+                payload["charge_status"] = status
+
+                if payload.get("percent") is None and payload.get("full_charge_capacity_mwh") and payload.get("design_capacity_mwh"):
+                    try:
+                        payload["percent"] = (payload["full_charge_capacity_mwh"] / payload["design_capacity_mwh"]) * 100.0
+                    except ZeroDivisionError:
+                        pass
+
+                break
+            except Exception as exc:
+                self.logger.log(f"[ERROR-SIC-Linux] Error collecting battery info from {device}: {exc}")
+
+        return payload
+
+    def _finalize_battery_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        has_battery = bool(payload.get("has_battery"))
+
+        percent = payload.get("percent")
+        if percent is None and payload.get("remaining_capacity_mwh") and payload.get("full_charge_capacity_mwh"):
+            try:
+                percent = (payload["remaining_capacity_mwh"] / payload["full_charge_capacity_mwh"]) * 100.0
+            except ZeroDivisionError:
+                percent = None
+
+        health_pct = payload.get("full_charge_capacity_mwh") and payload.get("design_capacity_mwh")
+        if health_pct:
+            try:
+                health_pct = (payload["full_charge_capacity_mwh"] / payload["design_capacity_mwh"]) * 100.0
+            except ZeroDivisionError:
+                health_pct = None
+        else:
+            health_pct = percent
+
+        def fmt_percent(value: Optional[float]) -> str:
+            return "Unknown" if value is None else f"{value:.1f}%"
+
+        def fmt_capacity(value: Optional[float]) -> str:
+            return "N/A" if value is None else f"{value:.0f} mWh"
+
+        def fmt_temp(value: Optional[float]) -> str:
+            return "Unknown" if value is None else f"{value:.1f} °C"
+
+        def fmt_voltage(value: Optional[float]) -> str:
+            return "Unknown" if value is None else (f"{value/1000.0:.2f} V" if value and value > 10 else f"{value:.2f} V")
+
+        charge_status = payload.get("charge_status", "unknown")
+        if isinstance(charge_status, str):
+            normalized_status = charge_status.lower().replace('_', ' ')
+        else:
+            normalized_status = "unknown"
+
+        if normalized_status in {"charging", "fully charged"}:
+            charging_label = "Charging"
+        elif normalized_status in {"discharging"}:
+            charging_label = "Discharging"
+        elif normalized_status in {"fully-charged"}:
+            charging_label = "Fully Charged"
+        elif normalized_status in {"no battery", "unknown"} and not has_battery:
+            charging_label = "No battery detected"
+        elif normalized_status in {"yes", "true"}:
+            charging_label = "Charging"
+        elif normalized_status in {"no", "false"}:
+            charging_label = "Not charging"
+        else:
+            charging_label = normalized_status.title()
+
+        time_minutes = payload.get("time_remaining_minutes")
+        if time_minutes is not None:
+            hours = time_minutes / 60.0
+            suffix = "Charging" if "charg" in normalized_status else "Discharging"
+            time_remaining = f"{hours:.2f} hours ({suffix})"
+        else:
+            time_remaining = "Unknown"
+
+        condition = payload.get("condition")
+        if not condition and isinstance(health_pct, (int, float)):
+            if health_pct >= 85:
+                condition = "Optimal"
+            elif health_pct >= 65:
+                condition = "Serviceable"
+            elif health_pct >= 45:
+                condition = "Degraded"
+            else:
+                condition = "Critical"
+
+        cycle_count_val = payload.get("cycle_count")
+        if cycle_count_val in (None, "", "Unknown"):
+            cycle_count_val = "Unknown"
+
+        def or_dash(value, formatter=None):
+            if value in (None, "", "Unknown"):
+                return "N/A"
+            return formatter(value) if formatter else value
+
         battery_info = {
-            "Charge": "N/A",
-            "Status": "No battery detected",
-            "Time Left": "Unknown",
-            "Cycle Count": "N/A",
-            "Design Capacity": "N/A",
-            "Last Full Capacity": "N/A",
-            "Current Capacity": "N/A",
-            "Health Percentage": "N/A"
+            "has_battery": has_battery,
+            "health_percentage": fmt_percent(health_pct if isinstance(health_pct, (int, float)) else self._extract_number(health_pct)) if has_battery else "No battery detected",
+            "cycle_count": cycle_count_val,
+            "design_capacity": or_dash(payload.get("design_capacity_mwh"), lambda v: fmt_capacity(v)),
+            "full_charge_capacity": or_dash(payload.get("full_charge_capacity_mwh"), lambda v: fmt_capacity(v)),
+            "current_capacity": or_dash(payload.get("remaining_capacity_mwh"), lambda v: fmt_capacity(v)),
+            "temperature": or_dash(payload.get("temperature_c"), lambda v: fmt_temp(v)),
+            "voltage": or_dash(payload.get("voltage_mv"), lambda v: fmt_voltage(v)),
+            "time_remaining": time_remaining if time_minutes is not None else "—",
+            "is_charging": charging_label,
+            "status": charging_label if has_battery else "No battery detected",
+            "condition": condition or ("No battery detected" if not has_battery else "—"),
         }
-        
-        if platform.system() == "Darwin": # macOS
-            try:
-                # Using pmset to get battery info
-                command = ["pmset", "-g", "batt", "-F", "plist"]
-                process = subprocess.run(command, capture_output=True, text=True, check=False) # check=False to handle non-zero exit codes gracefully
-                
-                if process.returncode != 0:
-                    self.logger.log(f"[ERROR-SIC-macOS] pmset command failed with exit code {process.returncode}")
-                    self.logger.log(f"[ERROR-SIC-macOS] pmset stdout: {process.stdout.strip()}")
-                    self.logger.log(f"[ERROR-SIC-macOS] pmset stderr: {process.stderr.strip()}")
-                    raise RuntimeError(f"pmset command failed: {process.stderr.strip() or process.stdout.strip()}")
-                
-                plist_data = plistlib.loads(process.stdout.encode('utf-8')) # Ensure bytes for plistlib
-                
-                if plist_data and 'IOPowerSources' in plist_data and plist_data['IOPowerSources']:
-                    batt = plist_data['IOPowerSources'][0]
-                    battery_info["Charge"] = f"{batt.get('Current Capacity', 0)}%"
-                    battery_info["Status"] = batt.get('Power Source State', 'Unknown')
-                    battery_info["Cycle Count"] = batt.get('Cycle Count', 'N/A')
-                    battery_info["Design Capacity"] = f"{batt.get('DesignCapacity', 'N/A')}"
-                    battery_info["Last Full Capacity"] = f"{batt.get('Max Capacity', 'N/A')}"
-                    battery_info["Health Percentage"] = f"{batt.get('Max Capacity', 0) / batt.get('DesignCapacity', 1) * 100:.1f}%" if batt.get('DesignCapacity', 1) > 0 else "N/A"
-                    
-                    time_to_empty = batt.get('Time to Empty', 0)
-                    time_to_charge = batt.get('Time to Full', 0)
-                    if time_to_empty > 0: battery_info["Time Left"] = f"{time_to_empty / 60:.2f} hours (Discharging)"
-                    elif time_to_charge > 0: battery_info["Time Left"] = f"{time_to_charge / 60:.2f} hours (Charging)"
-                    else: battery_info["Time Left"] = "Unknown"
-            except (subprocess.CalledProcessError, plistlib.InvalidFileException, RuntimeError) as e: # Corrected exception name
-                self.logger.log(f"[ERROR-SIC-macOS] Error getting detailed battery info: {e}")
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-macOS] An unexpected error occurred: {e}")
-        elif platform.system() == "Windows": # Windows
-            try:
-                # Use wmic for battery info
-                command = ["wmic", "path", "Win32_Battery", "get", "EstimatedChargeRemaining,BatteryStatus,DesignCapacity,FullChargeCapacity,CycleCount", "/value"]
-                process = subprocess.run(command, capture_output=True, text=True, check=True, shell=True)
-                output = process.stdout.strip()
-                
-                batt_status_map = {
-                    "1": "Discharging", "2": "Charging", "3": "Fully Charged", "4": "Low",
-                    "5": "Critical", "6": "Charging and Critical", "7": "Charging and Low",
-                    "8": "Partially Charged", "9": "Undefined", "10": "Unknown"
-                }
-                
-                # Parse /value output
-                data = {}
-                for line in output.splitlines():
-                    if '=' in line: # Only process lines with key-value pairs
-                        key, value = line.split('=', 1)
-                        data[key.strip()] = value.strip()
-                
-                battery_info["Charge"] = f"{data.get('EstimatedChargeRemaining', 'N/A')}%"
-                battery_info["Status"] = batt_status_map.get(data.get('BatteryStatus'), 'Unknown')
-                battery_info["Cycle Count"] = data.get('CycleCount', 'N/A')
-                battery_info["Design Capacity"] = f"{data.get('DesignCapacity', 'N/A')}"
-                battery_info["Last Full Capacity"] = f"{data.get('FullChargeCapacity', 'N/A')}"
-                if data.get('DesignCapacity') and data.get('FullChargeCapacity'):
-                    try:
-                        design = int(data['DesignCapacity'])
-                        full = int(data['FullChargeCapacity'])
-                        if design > 0: battery_info["Health Percentage"] = f"{full / design * 100:.1f}%"
-                    except ValueError: pass
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-Windows] Error getting detailed battery info: {e}")
-        elif platform.system() == "Linux": # Linux
-            try:
-                # Use upower for detailed battery info - first get battery device path
-                list_command = ["upower", "-e"]
-                list_process = subprocess.run(list_command, capture_output=True, text=True, check=True)
-                
-                # Find battery device
-                battery_device = None
-                for line in list_process.stdout.splitlines():
-                    if 'battery' in line.lower() or 'BAT' in line:
-                        battery_device = line.strip()
-                        break
-                
-                if not battery_device:
-                    raise RuntimeError("No battery device found")
-                
-                # Get detailed battery info
-                command = ["upower", "-i", battery_device]
-                process = subprocess.run(command, capture_output=True, text=True, check=True)
-                output = process.stdout.strip()
-                
-                data = {}
-                for line in output.splitlines():
-                    if ':' in line and not line.strip().startswith("power supply"): # Skip header
-                        key, value = line.split(':', 1)
-                        data[key.strip()] = value.strip()
-                
-                # Parse upower output - handle different field name formats
-                percentage = data.get('percentage', data.get('Percentage', '0')).replace('%', '')
-                battery_info["Charge"] = f"{float(percentage):.1f}%" if percentage != '0' else "N/A"
-                
-                state = data.get('state', data.get('State', 'Unknown'))
-                battery_info["Status"] = state.replace("fully-charged", "Fully Charged").replace("discharging", "Discharging").replace("charging", "Charging")
-                
-                # Handle time fields (upower outputs in seconds)
-                time_to_empty = data.get('time to empty', data.get('Time to empty', '0'))
-                time_to_full = data.get('time to full', data.get('Time to full', '0'))
-                
-                if state == "discharging" and time_to_empty and time_to_empty != '0':
-                    try:
-                        hours = float(time_to_empty.split()[0]) / 3600 if 'seconds' in time_to_empty else float(time_to_empty)
-                        battery_info["Time Left"] = f"{hours:.2f} hours (Discharging)"
-                    except (ValueError, IndexError):
-                        battery_info["Time Left"] = "Unknown"
-                elif state == "charging" and time_to_full and time_to_full != '0':
-                    try:
-                        hours = float(time_to_full.split()[0]) / 3600 if 'seconds' in time_to_full else float(time_to_full)
-                        battery_info["Time Left"] = f"{hours:.2f} hours (Charging)"
-                    except (ValueError, IndexError):
-                        battery_info["Time Left"] = "Unknown"
-                else:
-                    battery_info["Time Left"] = "Unknown"
-                
-                battery_info["Cycle Count"] = data.get('cycle-count', data.get('Cycle count', 'N/A'))
-                
-                # Handle energy fields (convert from Wh to mWh)
-                energy_design = data.get('energy-design', data.get('Energy (design)', '0')).replace(' Wh', '')
-                energy_full = data.get('energy-full', data.get('Energy (full)', '0')).replace(' Wh', '')
-                
-                try:
-                    design_val = float(energy_design) * 1000 if energy_design != '0' else 0
-                    battery_info["Design Capacity"] = f"{design_val:.0f} mWh" if design_val > 0 else "N/A"
-                except ValueError:
-                    battery_info["Design Capacity"] = "N/A"
-                
-                try:
-                    full_val = float(energy_full) * 1000 if energy_full != '0' else 0
-                    battery_info["Last Full Capacity"] = f"{full_val:.0f} mWh" if full_val > 0 else "N/A"
-                except ValueError:
-                    battery_info["Last Full Capacity"] = "N/A"
-                
-                # Calculate health percentage
-                try:
-                    design_val = float(energy_design) if energy_design != '0' else 0
-                    full_val = float(energy_full) if energy_full != '0' else 0
-                    if design_val > 0 and full_val > 0:
-                        battery_info["Health Percentage"] = f"{full_val / design_val * 100:.1f}%"
-                except (ValueError, ZeroDivisionError):
-                    pass
-            except Exception as e:
-                self.logger.log(f"[ERROR-SIC-Linux] Error getting detailed battery info: {e}")
-        
-        # Fallback to psutil if platform-specific commands fail or don't exist
-        if battery_info["Status"] == "No battery detected":
-            battery = psutil.sensors_battery()
-            if battery:
-                battery_info["Charge"] = f"{battery.percent}%"
-                battery_info["Status"] = "Charging" if battery.power_plugged else "Discharging"
-                battery_info["Time Left"] = f"{battery.secsleft / 3600:.2f} hours" if battery.secsleft != psutil.POWER_TIME_UNKNOWN else "Unknown"
-                battery_info["Cycle Count"] = battery._asdict().get('cycle_count', 'N/A') if hasattr(battery, '_asdict') else 'N/A'
-                
+
+        # Legacy alias keys for downstream compatibility
+        battery_info.update({
+            "Health Percentage": battery_info["health_percentage"],
+            "Cycle Count": battery_info["cycle_count"],
+            "Design Capacity": battery_info["design_capacity"],
+            "Last Full Capacity": battery_info["full_charge_capacity"],
+            "Current Capacity": battery_info["current_capacity"],
+            "Charge": fmt_percent(self._extract_number(percent)) if has_battery else "No battery detected",
+            "Time Left": battery_info["time_remaining"],
+            "Status": battery_info["status"],
+        })
+
         return battery_info
 
     def get_detailed_hardware_info(self):
@@ -2496,6 +2716,68 @@ class WipeOrchestratorMCP:
             "SMART Attributes (excerpt, full details in logs)": {}
         }
 
+    def _normalize_system_snapshot(self, snapshot: dict) -> dict:
+        """Ensure historical device info falls back to current system state."""
+        snapshot = snapshot or {}
+        os_info = snapshot.get('os_info') or {}
+        memory_info = snapshot.get('memory_info') or {}
+        disk_info = snapshot.get('disk_info') or []
+        logical_disks = snapshot.get('logical_disks') or []
+
+        if not os_info:
+            os_info = self.system_info_collector.get_os_info()
+        if not memory_info:
+            memory_info = self.system_info_collector.get_memory_info()
+        if not disk_info:
+            disk_info = self.system_info_collector.get_physical_disks()
+        if not logical_disks:
+            logical_disks = self.system_info_collector.get_disk_info()
+
+        return {
+            "operating_system": os_info.get('system', os_info.get('System', 'Unknown')),
+            "system_version": os_info.get('release', os_info.get('Release', 'Unknown')),
+            "architecture": os_info.get('machine', os_info.get('Machine', 'Unknown')),
+            "node_name": os_info.get('node', os_info.get('Node Name', 'Unknown')),
+            "memory_total": memory_info.get('total', memory_info.get('Total', 'Unknown')),
+            "memory_used": memory_info.get('used', memory_info.get('Used', 'Unknown')),
+            "memory_available": memory_info.get('available', memory_info.get('Available', 'Unknown')),
+            "storage_devices": len(disk_info),
+            "logical_disks": len(logical_disks)
+        }
+
+    def _strip_unavailable_fields(self, data: dict, keep_keys: Optional[set] = None) -> dict:
+        """Remove entries with empty, Unknown, or N/A values while preserving critical keys."""
+        keep_keys = keep_keys or set()
+        cleaned = {}
+        for key, value in data.items():
+            if key in keep_keys:
+                cleaned[key] = value
+                continue
+
+            if isinstance(value, dict):
+                if value:
+                    cleaned[key] = value
+                continue
+
+            if isinstance(value, (list, tuple, set)):
+                if value:
+                    cleaned[key] = value
+                continue
+
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"", "unknown", "n/a", "no data", "not available", "—"}:
+                    continue
+                cleaned[key] = value
+                continue
+
+            if value in (None,):
+                continue
+
+            cleaned[key] = value
+
+        return cleaned
+
     def _generate_wipe_certificate_json(self, wipe_job, public_key_id: str) -> dict:
         "Generates the JSON content for the wipe certificate using real data from the wipe job."
         # Handle both dict and sqlite3.Row objects
@@ -2582,6 +2864,9 @@ class WipeOrchestratorMCP:
         
         # Restructured certificate with vertical layout and no emojis
         wipe_id = safe_get(wipe_job, 'wipe_job_id', 'unknown')
+        # Normalize historical info so missing values fall back to current system state
+        normalized_before = self._normalize_system_snapshot(device_info_before)
+
         cert_data = {
             "CERTIFICATE INFORMATION": {
                 "Certificate ID": wipe_id,
@@ -2609,15 +2894,15 @@ class WipeOrchestratorMCP:
             
             "PRE-OPERATION ANALYSIS": {
                 "System Environment Before Wipe": {
-                    "Operating System": device_info_before.get('os_info', {}).get('system', 'Unknown'),
-                    "System Version": device_info_before.get('os_info', {}).get('release', 'Unknown'),
-                    "System Architecture": device_info_before.get('os_info', {}).get('machine', 'Unknown'),
-                    "Node Name": device_info_before.get('os_info', {}).get('node', 'Unknown'),
-                    "Available Memory": device_info_before.get('memory_info', {}).get('total', 'Unknown'),
-                    "Memory Used": device_info_before.get('memory_info', {}).get('used', 'Unknown'),
-                    "Memory Available": device_info_before.get('memory_info', {}).get('available', 'Unknown'),
-                    "Storage Devices Count": len(device_info_before.get('disk_info', [])),
-                    "Logical Disks Count": len(device_info_before.get('logical_disks', []))
+                    "Operating System": normalized_before["operating_system"],
+                    "System Version": normalized_before["system_version"],
+                    "System Architecture": normalized_before["architecture"],
+                    "Node Name": normalized_before["node_name"],
+                    "Available Memory": normalized_before["memory_total"],
+                    "Memory Used": normalized_before["memory_used"],
+                    "Memory Available": normalized_before["memory_available"],
+                    "Storage Devices Count": normalized_before["storage_devices"],
+                    "Logical Disks Count": normalized_before["logical_disks"]
                 },
                 "Target Assessment Results": self._analyze_target_before_wipe(target_path_str),
                 "Security Risk Evaluation": self._assess_security_risk(target_path_str),
@@ -2681,12 +2966,15 @@ class WipeOrchestratorMCP:
         }
 
         # Convert data to a canonical string for signing
+        ensure_keys()
         data_to_sign = json.dumps(cert_data, sort_keys=True)
-        signature = sign_bytes(data_to_sign.encode('utf-8')) # Use global sign_bytes
-        cert_data["DIGITAL AUTHENTICATION"]["Digital_Signature"] = signature.hex() # Store hex representation
+        signature_hex = sign_bytes(data_to_sign.encode('utf-8')).hex()
+        cert_data["DIGITAL AUTHENTICATION"]["Digital Signature"] = signature_hex
+        cert_data["DIGITAL AUTHENTICATION"]["Digital_Signature"] = signature_hex
         
         # Calculate certificate hash
         cert_hash = hashlib.sha256(data_to_sign.encode('utf-8')).hexdigest()
+        cert_data["DIGITAL AUTHENTICATION"]["Certificate Hash"] = cert_hash
         cert_data["DIGITAL AUTHENTICATION"]["Certificate_Hash"] = cert_hash
 
         return cert_data
@@ -2735,6 +3023,87 @@ class WipeOrchestratorMCP:
             "SMART Health Analysis": smart_data
         }
 
+        def _fallback_drive_summary() -> dict:
+            total_drives = len(physical_disks_info)
+            if total_drives == 0:
+                return {
+                    "system_health_summary": {
+                        "overall_health": "No drives detected",
+                        "healthy_drives": 0,
+                        "warning_drives": 0,
+                        "critical_drives": 0
+                    },
+                    "drives": [],
+                    "predictive_insights": {
+                        "risk_level": "Unknown",
+                        "notes": "SMART data unavailable"
+                    },
+                    "recommendations": [],
+                    "risk_assessment": {},
+                    "performance_metrics": {}
+                }
+
+            summarized_drives = []
+            for disk in physical_disks_info:
+                summarized_drives.append({
+                    "Path": disk.get("Path"),
+                    "Model": disk.get("Model"),
+                    "Serial": disk.get("Serial"),
+                    "Type": disk.get("Type"),
+                    "Size": disk.get("Size"),
+                    "Status": "SMART data pending"
+                })
+
+            return {
+                "system_health_summary": {
+                    "overall_health": "Monitoring configured",
+                    "healthy_drives": total_drives,
+                    "warning_drives": 0,
+                    "critical_drives": 0
+                },
+                "drives": summarized_drives,
+                "predictive_insights": {
+                    "risk_level": "Low",
+                    "notes": "SMART data not returned; rely on physical inspection"
+                },
+                "recommendations": [],
+                "risk_assessment": {},
+                "performance_metrics": {}
+            }
+
+        smart_report_payload = smart_data if smart_data else {}
+        if not smart_report_payload or smart_report_payload in ({}, None):
+            smart_report_payload = _fallback_drive_summary()
+        else:
+            defaults = _fallback_drive_summary()
+            for key, value in defaults.items():
+                existing = smart_report_payload.get(key)
+                if isinstance(existing, str) and existing.lower() in {"", "none", "unknown", "n/a"}:
+                    smart_report_payload[key] = value
+                elif not existing:
+                    smart_report_payload[key] = value
+
+        detailed_assessment = self._enhance_battery_analysis(battery_health)
+        battery_analysis = self._strip_unavailable_fields({
+            "Health Status": self._format_battery_health(battery_health),
+            "Cycle Count": battery_health.get('cycle_count', 'Unknown'),
+            "Capacity Remaining": battery_health.get('health_percentage', 'Unknown'),
+            "Charging Status": battery_health.get('is_charging', 'Unknown'),
+            "Battery Temperature": battery_health.get('temperature'),
+            "Voltage": battery_health.get('voltage'),
+            "Time Remaining": battery_health.get('time_remaining'),
+            "Recommendation": detailed_assessment.get("Recommendation") if isinstance(detailed_assessment, dict) else None
+        }, keep_keys={"Cycle Count", "Recommendation"})
+
+        storage_intelligence = self._strip_unavailable_fields({
+            "Drive Health Summary": smart_report_payload.get('system_health_summary', {}),
+            "Individual Drive Status": smart_report_payload.get('drives', []),
+            "Predictive Analysis Results": smart_report_payload.get('predictive_insights', {}),
+            "Maintenance Recommendations": smart_report_payload.get('recommendations', []),
+            "Risk Assessment": smart_report_payload.get('risk_assessment', {}),
+            "Performance Metrics": smart_report_payload.get('performance_metrics', {})
+        })
+
         # Enhanced refurbish report with vertical layout and no emojis
         wipe_id = safe_get(wipe_job, 'wipe_job_id', 'unknown')
         report_data = {
@@ -2775,21 +3144,11 @@ class WipeOrchestratorMCP:
                     "Platform": os_info.get('platform', 'N/A'),
                     "Processor Type": os_info.get('processor', 'N/A')
                 },
-                "Performance Assessment Results": self._get_performance_metrics(),
-                "Compatibility Analysis Results": self._assess_compatibility()
+                "Performance Assessment Results": self._get_performance_metrics()
             },
             
             "COMPONENT HEALTH STATUS": {
-                "Battery Health Analysis": {
-                    "Health Status": self._format_battery_health(battery_health),
-                    "Cycle Count": battery_health.get('cycle_count', 'Unknown'),
-                    "Capacity Remaining": battery_health.get('health_percentage', 'Unknown'),
-                    "Charging Status": battery_health.get('is_charging', 'Unknown'),
-                    "Battery Temperature": battery_health.get('temperature', 'Unknown'),
-                    "Voltage": battery_health.get('voltage', 'Unknown'),
-                    "Time Remaining": battery_health.get('time_remaining', 'Unknown'),
-                    "Detailed Assessment": self._enhance_battery_analysis(battery_health)
-                },
+                "Battery Health Analysis": battery_analysis,
                 "Storage Health Analysis": {
                     "Physical Drives Count": f"{len(physical_disks_info)} drives detected",
                     "Logical Partitions Count": f"{len(logical_partitions_info)} partitions",
@@ -2802,14 +3161,7 @@ class WipeOrchestratorMCP:
                 "Component Lifecycle Assessment": self._assess_component_lifecycle(battery_health, storage_health)
             },
             
-            "STORAGE INTELLIGENCE REPORT": {
-                "Drive Health Summary": smart_data.get('system_health_summary', {}),
-                "Individual Drive Status": smart_data.get('drives', []),
-                "Predictive Analysis Results": smart_data.get('predictive_insights', {}),
-                "Maintenance Recommendations": smart_data.get('recommendations', []),
-                "Risk Assessment": smart_data.get('risk_assessment', {}),
-                "Performance Metrics": smart_data.get('performance_metrics', {})
-            },
+            "STORAGE INTELLIGENCE REPORT": storage_intelligence,
             
             "QUALITY ASSURANCE": {
                 "Testing Results": {
@@ -2819,15 +3171,7 @@ class WipeOrchestratorMCP:
                     "Performance Benchmarks": self._get_qa_testing_results(),
                     "Stress Test Results": "Completed",
                     "Compatibility Test Results": "Verified"
-                },
-                "Compliance Verification": {
-                    "Environmental Standards": "ISO 14001 Compliant",
-                    "Electronic Waste Management": "WEEE Directive Compliant",
-                    "Hazardous Substances Restriction": "RoHS Compliant",
-                    "Data Protection Compliance": "GDPR Compliant",
-                    "Energy Efficiency Standards": "ENERGY STAR Compliant"
-                },
-                "Warranty and Certification Information": self._generate_warranty_info()
+                }
             },
             
             "RECOMMENDATIONS AND INSIGHTS": {
@@ -3610,12 +3954,20 @@ class WipeOrchestratorMCP:
         except Exception:
             return {"Performance_Assessment": "Unavailable"}
     
-    def _assess_compatibility(self) -> dict:
-        """Assess system compatibility"""
+    def _assess_compatibility(self, os_info: dict, cpu_info: dict, mem_info: dict) -> dict:
+        """Assess system compatibility based on collected hardware data"""
+        system_name = os_info.get('system', os_info.get('System', 'Unknown'))
+        release = os_info.get('release', os_info.get('Release', 'Unknown'))
+        architecture = os_info.get('machine', os_info.get('Machine', 'Unknown'))
+        total_ram = mem_info.get('Total', 'Unknown')
+        used_ram = mem_info.get('Used', 'Unknown')
+        total_cores = cpu_info.get('Total Cores', cpu_info.get('total_cores', 'Unknown'))
+
         return {
-            "OS_Compatibility": "Modern OS Support",
-            "Software_Compatibility": "Standard Applications",
-            "Hardware_Compatibility": "Current Standards",
+            "OS_Compatibility": f"Optimized for {system_name} {release}" if system_name != 'Unknown' else "Modern OS Support",
+            "Hardware_Compatibility": f"{architecture} architecture with {total_cores} cores", 
+            "Memory_Profile": f"{total_ram} installed, {used_ram} currently used",
+            "Virtualization_Ready": "Yes" if architecture and architecture.startswith(('x86', 'arm', 'aarch')) else "Unknown",
             "Future_Proofing": "3-5 years expected support"
         }
     
@@ -3624,18 +3976,15 @@ class WipeOrchestratorMCP:
         if not battery_health or battery_health.get('Error'):
             return {
                 "Status": "No Battery Detected or Desktop System",
-                "Analysis": "System does not require battery assessment",
                 "Recommendation": "N/A for desktop systems"
             }
-        
-        return {
-            "Current_Capacity": battery_health.get('Current Capacity', 'N/A'),
-            "Design_Capacity": battery_health.get('Design Capacity', 'N/A'),
-            "Health_Percentage": battery_health.get('Health Percentage', 'N/A'),
-            "Cycle_Count": battery_health.get('Cycle Count', 'N/A'),
-            "Condition": battery_health.get('Condition', 'N/A'),
+
+        return self._strip_unavailable_fields({
+            "Health Percentage": battery_health.get('Health Percentage'),
+            "Cycle Count": battery_health.get('Cycle Count'),
+            "Condition": battery_health.get('Condition'),
             "Recommendation": self._get_battery_recommendation(battery_health)
-        }
+        }, keep_keys={"Cycle Count", "Recommendation"})
     
     def _enhance_storage_analysis(self, storage_health: dict) -> dict:
         """Enhanced storage analysis"""
