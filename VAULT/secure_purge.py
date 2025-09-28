@@ -17,6 +17,14 @@ import multiprocessing as mp
 from queue import Empty
 import traceback
 
+# Import API client for sending wipe certificates to Django backend
+try:
+    from api_client import auto_send_wipe_certificate
+except ImportError:
+    # Fallback if api_client is not available
+    def auto_send_wipe_certificate(*args, **kwargs):
+        return {"success": False, "message": "API client not available"}
+
 # Configure module-level logger
 logging.basicConfig(
     level=logging.INFO,
@@ -4074,32 +4082,41 @@ class WipeOrchestratorMCP:
             if path_obj.exists():
                 if path_obj.is_file():
                     stat_info = path_obj.stat()
+                    permissions = oct(stat_info.st_mode)[-3:]  # Extract permissions
                     return {
                         "Type": "File",
                         "Size": f"{stat_info.st_size:,} bytes",
                         "Last_Modified": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
-                        "Permissions": oct(stat_info.st_mode)[-3:],
+                        "Permissions": permissions,
+                        "permissions": permissions,  # Django backend expects lowercase
                         "Inode": stat_info.st_ino
                     }
                 elif path_obj.is_dir():
                     file_count = sum(1 for _ in path_obj.rglob('*') if _.is_file())
+                    permissions = oct(path_obj.stat().st_mode)[-3:]
                     return {
                         "Type": "Directory",
                         "File_Count": file_count,
                         "Last_Modified": datetime.fromtimestamp(path_obj.stat().st_mtime).isoformat(),
-                        "Permissions": oct(path_obj.stat().st_mode)[-3:]
+                        "Permissions": permissions,
+                        "permissions": permissions,  # Django backend expects lowercase
                     }
             else:
+                # For block devices, provide default permissions
                 return {
                     "Type": "Block Device",
                     "Status": "Physical device detected",
-                    "Analysis": "Block-level device requiring low-level wiping"
+                    "Analysis": "Block-level device requiring low-level wiping",
+                    "Permissions": "600",  # Default for block devices
+                    "permissions": "600"   # Django backend expects lowercase
                 }
         except Exception as e:
             return {
                 "Type": "Unknown",
                 "Error": str(e),
-                "Status": "Analysis failed"
+                "Status": "Analysis failed",
+                "Permissions": "000",  # Default for unknown/error cases
+                "permissions": "000"   # Django backend expects lowercase
             }
     
     def _assess_security_risk(self, target_path: str) -> dict:
@@ -4129,13 +4146,16 @@ class WipeOrchestratorMCP:
                 "Verification_Status": "PASSED",
                 "Target_Accessibility": "Not Accessible (Expected)",
                 "Data_Recovery_Test": "No recoverable data found",
-                "Filesystem_Check": "Target completely removed"
+                "Filesystem_Check": "Target completely removed",
+                "Recommendation": "Wipe operation completed successfully - no further action required",
+                "recommendation": "Wipe operation completed successfully - no further action required"  # Django backend expects lowercase
             }
         else:
             return {
                 "Verification_Status": "WARNING",
                 "Target_Accessibility": "Still Accessible",
-                "Recommendation": "Manual verification required"
+                "Recommendation": "Manual verification required - target still exists after wipe",
+                "recommendation": "Manual verification required - target still exists after wipe"  # Django backend expects lowercase
             }
     
     def _get_security_confirmation(self, target_path: str) -> dict:
@@ -4595,6 +4615,40 @@ class WipeOrchestratorMCP:
 
         self.gui_logger.log(f"[MCP] Certificates generated. Wipe ID: {certificate_id}. Check model_artifacts folder.")
         self.gui_logger.log(f"[MCP] Verification URL: https://verify.example.org/certs/{certificate_id}")
+        
+        # Automatically send wipe certificate to Django backend API
+        self._send_certificate_to_backend(certificate_id)
+    
+    def _send_certificate_to_backend(self, certificate_id: str):
+        """
+        Automatically send the wipe certificate to the Django backend API.
+        
+        Args:
+            certificate_id: The certificate ID to send
+        """
+        try:
+            # Django backend API endpoint
+            api_endpoint = "https://commercial-website-8a8m.onrender.com/api/wipe-certificates/"
+            
+            # Send the certificate
+            result = auto_send_wipe_certificate(
+                certificate_id=certificate_id,
+                model_artifacts_dir=MODEL_ARTIFACT_DIR,
+                api_endpoint=api_endpoint,
+                gui_logger=self.gui_logger
+            )
+            
+            if result["success"]:
+                self.gui_logger.log("[MCP-API] ✓ Wipe certificate successfully sent to backend")
+                if "response" in result and result["response"]:
+                    self.gui_logger.log(f"[MCP-API] Server response: {result['response']}")
+            else:
+                self.gui_logger.log(f"[MCP-API] ✗ Failed to send certificate: {result['message']}")
+                
+        except Exception as e:
+            error_msg = f"[MCP-API] Unexpected error sending certificate: {str(e)}"
+            self.gui_logger.log(error_msg)
+            self._mcp_log(error_msg)
 
 def hash_file(path: Path) -> str:
     h = hashlib.sha256()
