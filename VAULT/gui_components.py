@@ -490,7 +490,7 @@ class MaintenanceTab(QWidget):
         drive_health_layout.setContentsMargins(12, 10, 12, 12)
         drive_health_layout.setSpacing(12)
 
-        self.drive_health_intro = QLabel("Real-time maintenance signals derived from live storage telemetry.")
+        self.drive_health_intro = QLabel("Prioritized maintenance playbooks generated from current storage telemetry.")
         self.drive_health_intro.setObjectName("driveHealthIntro")
         self.drive_health_intro.setWordWrap(True)
         drive_health_layout.addWidget(self.drive_health_intro)
@@ -507,6 +507,7 @@ class MaintenanceTab(QWidget):
         self.drive_health_list_layout.setSpacing(10)
         self.drive_health_scroll.setWidget(self.drive_health_list_container)
 
+        self.drive_health_scroll.setMinimumHeight(260)
         drive_health_layout.addWidget(self.drive_health_scroll)
 
         self.drive_health_timestamp = QLabel("Last refreshed —")
@@ -515,7 +516,7 @@ class MaintenanceTab(QWidget):
 
         drive_health_layout.addStretch()
         self.drive_health_group.setLayout(drive_health_layout)
-        layout.addWidget(self.drive_health_group)
+        layout.addWidget(self.drive_health_group, 2)
 
         # Drive Usage Visualization Section (Maintenance Planner)
         self.graph_group = QGroupBox("Drive Usage Distribution")
@@ -575,7 +576,7 @@ class MaintenanceTab(QWidget):
         graph_layout.addWidget(self.timeline_container)
 
         self.graph_group.setLayout(graph_layout)
-        layout.addWidget(self.graph_group)
+        layout.addWidget(self.graph_group, 1)
 
 
         layout.addStretch()
@@ -961,74 +962,167 @@ class MaintenanceTab(QWidget):
             self.drive_health_timestamp.setText("Last refreshed —")
             return
 
-        for state in drive_states:
-            row = self._create_health_signal_row(state)
-            self.drive_health_list_layout.addWidget(row)
+        actions = self._generate_maintenance_actions(drive_states)
+
+        if not actions:
+            empty_label = QLabel("No maintenance guidance available.")
+            empty_label.setObjectName("driveUsageEmpty")
+            empty_label.setAlignment(Qt.AlignCenter)
+            self.drive_health_list_layout.addWidget(empty_label)
+            self.drive_health_timestamp.setText("Last refreshed —")
+            return
+
+        for action in actions:
+            card = self._create_maintenance_card(action)
+            self.drive_health_list_layout.addWidget(card)
 
         self.drive_health_list_layout.addStretch()
         self.drive_health_timestamp.setText(f"Last refreshed {datetime.now().strftime('%H:%M:%S')}")
 
-    def _create_health_signal_row(self, state: dict):
+    def _generate_maintenance_actions(self, drive_states: list[dict]) -> list[dict]:
+        if not drive_states:
+            return []
+
+        counts = {"critical": 0, "warning": 0, "stable": 0}
+        critical_drives = []
+        warning_drives = []
+        stable_drives = []
+
+        for state in drive_states:
+            counts[state["severity"]] += 1
+            if state["severity"] == "critical":
+                critical_drives.append(state)
+            elif state["severity"] == "warning":
+                warning_drives.append(state)
+            else:
+                stable_drives.append(state)
+
+        # Sort to keep the hottest drives first
+        critical_drives.sort(key=lambda s: s["usage_percent"], reverse=True)
+        warning_drives.sort(key=lambda s: s["usage_percent"], reverse=True)
+        stable_drives.sort(key=lambda s: s["usage_percent"], reverse=True)
+
+        most_utilized = max(drive_states, key=lambda s: s["usage_percent"], default=None)
+
+        actions: list[dict] = []
+
+        if critical_drives:
+            top = critical_drives[0]
+            actions.append({
+                "title": "Emergency Capacity Recovery",
+                "severity": "critical",
+                "summary": f"{counts['critical']} drive(s) are saturated and require immediate action.",
+                "detail": f"Top pressure: {top['device']} at {top['usage_percent']:.0f}% with just {top['free_display']} free.",
+                "steps": [
+                    "Launch secure purge for redundant or temporary artifacts.",
+                    "Migrate cold archives to auxiliary storage to relieve load.",
+                    "Verify SMART diagnostics after freeing at least 10% capacity."
+                ]
+            })
+
+        if warning_drives:
+            top_warning = warning_drives[0]
+            actions.append({
+                "title": "Capacity Stabilization Plan",
+                "severity": "warning",
+                "summary": f"{counts['warning']} drive(s) are nearing threshold and should be addressed this week.",
+                "detail": f"Lead candidate: {top_warning['device']} at {top_warning['usage_percent']:.0f}% with {top_warning['free_display']} remaining.",
+                "steps": [
+                    "Archive old release artifacts and compress large log directories.",
+                    "Confirm backup snapshots and prune duplicates.",
+                    "Schedule expansion or rotation during the next change window."
+                ]
+            })
+
+        if stable_drives:
+            rep = stable_drives[0]
+            actions.append({
+                "title": "Preventive Maintenance Cadence",
+                "severity": "stable",
+                "summary": f"{counts['stable']} drive(s) remain healthy. Keep preventive tasks on schedule.",
+                "detail": f"Monitor trend on {rep['device']} (currently {rep['usage_percent']:.0f}% utilized).",
+                "steps": [
+                    "Audit retention policies and confirm at least one verified backup restore.",
+                    "Run filesystem integrity checks and trim operations where supported.",
+                    "Log capacity forecast for the next quarter review."
+                ]
+            })
+
+        if most_utilized and counts["critical"] + counts["warning"]:
+            actions.append({
+                "title": "Compliance & Reporting",
+                "severity": "warning" if counts["critical"] else "stable",
+                "summary": "Document remediation steps and notify stakeholders.",
+                "detail": f"Focus report on {most_utilized['device']} ({most_utilized['usage_percent']:.0f}% utilized, {most_utilized['free_display']} free).",
+                "steps": [
+                    "Capture before/after storage snapshots for audit logs.",
+                    "Update maintenance ticket with executed actions and evidence.",
+                    "Schedule follow-up verification 48 hours after remediation."
+                ]
+            })
+
+        return actions
+
+    def _create_maintenance_card(self, action: dict):
         row = QFrame()
         row.setObjectName("driveHealthRow")
         row.setAccessibleName(
-            f"{state['device']} status {state['severity_label']} with action {state['action']}"
+            f"{action['title']} maintenance playbook"
         )
         row.setFocusPolicy(Qt.StrongFocus)
 
         layout = QVBoxLayout(row)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
 
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(8)
+        header_layout.setSpacing(10)
 
         indicator = QLabel()
         indicator.setFixedSize(10, 10)
+        color = self._state_colors.get(action["severity"], self._state_colors["stable"])
         indicator.setStyleSheet(
-            f"background-color: {state['severity_color']}; border-radius: 5px;"
+            f"background-color: {color}; border-radius: 5px;"
         )
-        indicator.setAccessibleName(f"{state['severity_label']} indicator")
+        indicator.setAccessibleName(f"{action['severity']} indicator")
         header_layout.addWidget(indicator)
 
-        device_label = QLabel(f"{state['device']} • {state['model']}")
-        device_label.setObjectName("driveHealthDevice")
-        device_label.setToolTip(f"Mounted at {state['mountpoint']} ({state['filesystem']})")
-        header_layout.addWidget(device_label)
+        title_label = QLabel(action["title"])
+        title_label.setObjectName("driveHealthDevice")
+        title_label.setStyleSheet(f"color: {color};")
+        header_layout.addWidget(title_label)
 
         header_layout.addStretch()
 
-        badge = QLabel(state["severity_label"])
+        badge = QLabel(action["severity"].upper())
         badge.setStyleSheet(
-            f"border: 1px solid {state['severity_color']}; border-radius: 9px; padding: 2px 8px;"
-            f"color: {state['severity_color']}; font-size: 11px; font-weight: 600; text-transform: uppercase;"
+            f"border: 1px solid {color}; border-radius: 9px; padding: 2px 8px;"
+            f"color: {color}; font-size: 11px; font-weight: 600; text-transform: uppercase;"
         )
         header_layout.addWidget(badge)
 
         layout.addLayout(header_layout)
 
-        progress = QProgressBar()
-        progress.setRange(0, 100)
-        progress.setValue(int(state["usage_percent"] or 0))
-        progress.setTextVisible(False)
-        progress.setFixedHeight(8)
-        progress.setStyleSheet(
-            "QProgressBar { background-color: #0E1116; border: 1px solid #2A2D32; border-radius: 4px; }"
-            f"QProgressBar::chunk {{ background-color: {state['severity_color']}; border-radius: 4px; }}"
-        )
-        layout.addWidget(progress)
+        summary_label = QLabel(action["summary"])
+        summary_label.setObjectName("driveHealthAction")
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
 
-        meta_label = QLabel(
-            f"Utilization {state['usage_percent']:.1f}% • Free {state['free_display']} • Total {state['total_display']}"
-        )
-        meta_label.setObjectName("driveHealthMeta")
-        layout.addWidget(meta_label)
+        if detail := action.get("detail"):
+            detail_label = QLabel(detail)
+            detail_label.setObjectName("driveHealthMeta")
+            detail_label.setWordWrap(True)
+            layout.addWidget(detail_label)
 
-        action_label = QLabel(state["action"])
-        action_label.setObjectName("driveHealthAction")
-        action_label.setWordWrap(True)
-        layout.addWidget(action_label)
+        if action.get("steps"):
+            steps_label = QLabel()
+            steps_label.setObjectName("driveHealthAction")
+            steps_label.setWordWrap(True)
+            steps_label.setTextFormat(Qt.RichText)
+            steps_html = "<ul>" + "".join(f"<li>{step}</li>" for step in action["steps"]) + "</ul>"
+            steps_label.setText(steps_html)
+            layout.addWidget(steps_label)
 
         return row
 
