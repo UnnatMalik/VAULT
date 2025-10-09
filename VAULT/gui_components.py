@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
-from PySide6.QtCore import QObject, Signal, QThread, Qt, QDateTime, QSize
+from PySide6.QtCore import QObject, Signal, QThread, Qt, QDateTime, QSize, QTimer
 from PySide6.QtGui import QFont, QIcon, QColor
 from metadata_worker import MetadataWorker
 import uuid
@@ -16,6 +16,7 @@ import subprocess
 import platform
 import re
 import traceback
+import logging
 # Import all required dependencies from secure_purge.py
 from secure_purge import (
     SystemInfoCollector,
@@ -27,6 +28,9 @@ from secure_purge import (
     ensure_keys,
     _perform_secure_purge_logic
 )
+
+
+logger = logging.getLogger(__name__)
 
 # Import SMART monitoring components
 try:
@@ -116,8 +120,11 @@ class HomeTab(QWidget):
 
             self._apply_theme()
             self._setup_ui()
+            self.metrics_timer = QTimer(self)
+            self.metrics_timer.setInterval(10_000)
+            self.metrics_timer.setTimerType(Qt.VeryCoarseTimer)
+            self.metrics_timer.timeout.connect(self._refresh_system_summary)
             # Load data asynchronously after GUI is shown to prevent blocking
-            from PySide6.QtCore import QTimer
             QTimer.singleShot(100, self._load_data)
 
         def _setup_ui(self):
@@ -194,6 +201,8 @@ class HomeTab(QWidget):
             disk_info = self.system_info_collector.get_disk_info()
             self._update_storage_visualization(disk_info)
             self._update_system_summary()
+            if not self.metrics_timer.isActive():
+                self.metrics_timer.start()
 
         def _update_storage_visualization(self, disk_info):
             while self.drive_container_layout.count():
@@ -413,6 +422,17 @@ class HomeTab(QWidget):
                 }}
                 """
             )
+
+        def _refresh_system_summary(self):
+            try:
+                self._update_system_summary()
+            except Exception as exc:
+                logger.error(f"Failed to refresh system summary: {exc}")
+
+        def closeEvent(self, event):
+            if hasattr(self, "metrics_timer") and self.metrics_timer.isActive():
+                self.metrics_timer.stop()
+            super().closeEvent(event)
 
 
 # The `MaintenanceTab` class in Python creates a GUI tab for displaying drive health status, drive

@@ -85,6 +85,45 @@ import re # Added for regex in macOS disk detection
 from PySide6.QtWidgets import QApplication, QTextEdit
 
 
+def _is_gui_launch(argv: List[str]) -> bool:
+    """Determine if the process should start the GUI instead of the CLI."""
+    if len(argv) <= 1:
+        return True
+
+    # macOS adds a special process serial number argument when double-clicking an app
+    usable_args = [arg for arg in argv[1:] if not arg.startswith("-psn")]
+    return len(usable_args) == 0
+
+
+def suppress_console_window_if_needed(argv: List[str]) -> None:
+    """Hide/detach the console window when running in GUI mode."""
+    if not _is_gui_launch(argv):
+        return
+
+    try:
+        if os.name == "nt":
+            if getattr(sys, "frozen", False):
+                import ctypes
+
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                    ctypes.windll.kernel32.FreeConsole()
+        elif sys.platform == "darwin":
+            if getattr(sys, "frozen", False):
+                devnull = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+                sys.stdout = devnull
+                sys.stderr = devnull
+        else:
+            if getattr(sys, "frozen", False):
+                devnull = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+                sys.stdout = devnull
+                sys.stderr = devnull
+    except Exception:
+        # Failing to hide the console should never crash the app
+        logger.debug("Console suppression failed", exc_info=True)
+
+
 # ---------------------
 # Paths: script dir and output dir inside codebase - NEW
 # ---------------------
@@ -5282,12 +5321,16 @@ def initialize_application():
         return False
 
 if __name__ == "__main__":
+    launch_gui = _is_gui_launch(sys.argv)
+    if launch_gui:
+        suppress_console_window_if_needed(sys.argv)
+
     # Initialize application first
     if not initialize_application():
         print("Failed to initialize application. Check logs for details.", file=sys.stderr)
         sys.exit(1)
         
-    if len(sys.argv) > 1 and all(not arg.startswith('-psn') for arg in sys.argv):
+    if not launch_gui:
         cli_main()
     else:
         # Import here to avoid circular dependency
