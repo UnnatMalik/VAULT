@@ -378,8 +378,7 @@ class ContentAnalyzer:
             self.text_classifier = TextClassifier(model_path=classifier_model_path) if classifier_model_path else None
             
             # Add custom pipeline components
-            if not self.nlp.has_pipe('sensitive_info'):
-                self.nlp.add_pipe('sensitive_info', before='parser')
+            ensure_sensitive_info_component(self.nlp)
             
             # Initialize KeyBERT for keyword extraction
             self.keybert_model = KeyBERT()
@@ -3173,10 +3172,16 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error caching analysis: {e}")
 
-# Register custom pipeline components
-@Language.component('sensitive_info')
-def sensitive_info_component(doc):
+# Register custom pipeline components without spaCy's decorator so it works in frozen builds
+def sensitive_info_component(doc: Doc) -> Doc:
     """Custom pipeline component to detect sensitive information."""
     # This is a placeholder. In a real implementation, you'd add more sophisticated
     # detection logic here.
     return doc
+
+
+def ensure_sensitive_info_component(nlp: Language) -> None:
+    """Add the sensitive info component to the pipeline if it's not already present."""
+    if 'sensitive_info' in nlp.pipe_names:
+        return
+    nlp.add_pipe(sensitive_info_component, name='sensitive_info', before='parser')

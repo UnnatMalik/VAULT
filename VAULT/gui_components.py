@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
-from PySide6.QtCore import QObject, Signal, QThread, Qt, QDateTime, QSize, QTimer
+from PySide6.QtCore import QObject, Signal, QThread, Qt, QDateTime, QSize
 from PySide6.QtGui import QFont, QIcon, QColor
 from metadata_worker import MetadataWorker
 import uuid
@@ -16,7 +16,6 @@ import subprocess
 import platform
 import re
 import traceback
-import logging
 # Import all required dependencies from secure_purge.py
 from secure_purge import (
     SystemInfoCollector,
@@ -26,11 +25,9 @@ from secure_purge import (
     Logger,
     verify_manifest_deletions,
     ensure_keys,
-    _perform_secure_purge_logic
+    _perform_secure_purge_logic,
+    run_quiet_subprocess
 )
-
-
-logger = logging.getLogger(__name__)
 
 # Import SMART monitoring components
 try:
@@ -120,11 +117,8 @@ class HomeTab(QWidget):
 
             self._apply_theme()
             self._setup_ui()
-            self.metrics_timer = QTimer(self)
-            self.metrics_timer.setInterval(10_000)
-            self.metrics_timer.setTimerType(Qt.VeryCoarseTimer)
-            self.metrics_timer.timeout.connect(self._refresh_system_summary)
             # Load data asynchronously after GUI is shown to prevent blocking
+            from PySide6.QtCore import QTimer
             QTimer.singleShot(100, self._load_data)
 
         def _setup_ui(self):
@@ -144,8 +138,6 @@ class HomeTab(QWidget):
             self.summary_metrics = {}
             metric_specs = [
                 ("os", "Operating System"),
-                ("cpu", "CPU Load"),
-                ("memory", "Memory"),
                 ("battery", "Battery"),
             ]
             for key, label_text in metric_specs:
@@ -201,8 +193,6 @@ class HomeTab(QWidget):
             disk_info = self.system_info_collector.get_disk_info()
             self._update_storage_visualization(disk_info)
             self._update_system_summary()
-            if not self.metrics_timer.isActive():
-                self.metrics_timer.start()
 
         def _update_storage_visualization(self, disk_info):
             while self.drive_container_layout.count():
@@ -282,8 +272,6 @@ class HomeTab(QWidget):
             detailed_hardware_info = self.system_info_collector.get_detailed_hardware_info()
 
             os_summary = f"{os_info.get('System', '-') } {os_info.get('Release', '')}".strip()
-            cpu_summary = f"{cpu_info.get('Total Usage', '-')} @ {cpu_info.get('Current Frequency', '-') }"
-            memory_summary = f"{mem_info.get('Used', '-') } / {mem_info.get('Total', '-') } ({mem_info.get('Percentage', '-')})"
 
             battery_info = self.system_info_collector.get_battery_info()
             if 'Charge' in battery_info:
@@ -292,8 +280,6 @@ class HomeTab(QWidget):
                 battery_summary = battery_info.get('Status', 'Unavailable')
 
             self.summary_metrics['os'].setText(os_summary or '—')
-            self.summary_metrics['cpu'].setText(cpu_summary)
-            self.summary_metrics['memory'].setText(memory_summary)
             self.summary_metrics['battery'].setText(battery_summary)
 
             self.system_details_labels['Node'].setText(os_info.get('Node Name', '—'))
@@ -422,17 +408,6 @@ class HomeTab(QWidget):
                 }}
                 """
             )
-
-        def _refresh_system_summary(self):
-            try:
-                self._update_system_summary()
-            except Exception as exc:
-                logger.error(f"Failed to refresh system summary: {exc}")
-
-        def closeEvent(self, event):
-            if hasattr(self, "metrics_timer") and self.metrics_timer.isActive():
-                self.metrics_timer.stop()
-            super().closeEvent(event)
 
 
 # The `MaintenanceTab` class in Python creates a GUI tab for displaying drive health status, drive
@@ -2567,12 +2542,13 @@ class InfoTab(QWidget):
 
         for command, parser in detector_chain:
             try:
-                result = subprocess.run(
+                result = run_quiet_subprocess(
                     command,
                     capture_output=True,
                     text=True,
                     timeout=5,
-                    check=False
+                    check=True,
+                    shell=platform.system() == "Windows"
                 )
                 parsed = parser(result)
                 if parsed:

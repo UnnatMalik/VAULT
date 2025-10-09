@@ -26,3 +26,5 @@ chardet
 pyinstaller
 wheel
 setuptools
+tensorboard
+expecttest

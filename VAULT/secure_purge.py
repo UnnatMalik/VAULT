@@ -39,6 +39,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import subprocess
+import ctypes
 import plistlib
 import shutil
 import io
@@ -122,6 +123,24 @@ def suppress_console_window_if_needed(argv: List[str]) -> None:
     except Exception:
         # Failing to hide the console should never crash the app
         logger.debug("Console suppression failed", exc_info=True)
+
+
+def run_quiet_subprocess(command: Union[List[str], str], **kwargs) -> subprocess.CompletedProcess:
+    """Run subprocess with flags that prevent new console windows on Windows."""
+    if os.name == "nt":
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startf_use_showwindow = getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo_cls = getattr(subprocess, "STARTUPINFO", None)
+
+        if startupinfo_cls is not None:
+            startupinfo = kwargs.get("startupinfo") or startupinfo_cls()
+            startupinfo.dwFlags |= startf_use_showwindow
+            startupinfo.wShowWindow = 0  # SW_HIDE
+            kwargs["startupinfo"] = startupinfo
+
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
+
+    return subprocess.run(command, **kwargs)
 
 
 # ---------------------
@@ -1269,7 +1288,7 @@ class SystemInfoCollector:
 
         if not brand and system == "Darwin":
             try:
-                result = subprocess.run(
+                result = run_quiet_subprocess(
                     ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
                     capture_output=True,
                     text=True,
@@ -1285,7 +1304,7 @@ class SystemInfoCollector:
 
         if not brand and system == "Windows":
             try:
-                result = subprocess.run(
+                result = run_quiet_subprocess(
                     ["wmic", "cpu", "get", "name"],
                     capture_output=True,
                     text=True,
@@ -1409,7 +1428,7 @@ class SystemInfoCollector:
         payload: Dict[str, Any] = {"has_battery": False}
         try:
             command = ["system_profiler", "SPPowerDataType", "-json"]
-            process = subprocess.run(command, capture_output=True, text=True, check=True)
+            process = run_quiet_subprocess(command, capture_output=True, text=True, check=True)
             data = json.loads(process.stdout)
             power_data = data.get("SPPowerDataType", [])
             if not power_data:
@@ -1494,7 +1513,7 @@ class SystemInfoCollector:
             if not payload.get("cycle_count"):
                 try:
                     ioreg_cmd = ["ioreg", "-rn", "AppleSmartBattery", "-a"]
-                    ioreg_proc = subprocess.run(ioreg_cmd, capture_output=True, check=True)
+                    ioreg_proc = run_quiet_subprocess(ioreg_cmd, capture_output=True, check=True)
                     ioreg_data = plistlib.loads(ioreg_proc.stdout)
                     if ioreg_data:
                         fallback_cycle = ioreg_data[0].get("CycleCount")
@@ -1517,7 +1536,7 @@ class SystemInfoCollector:
                 "-Command",
                 "Get-CimInstance -ClassName Win32_Battery | ConvertTo-Json"
             ]
-            process = subprocess.run(command, capture_output=True, text=True, check=True, shell=False)
+            process = run_quiet_subprocess(command, capture_output=True, text=True, check=True, shell=False)
             output = process.stdout.strip()
             if not output:
                 return payload
@@ -1561,7 +1580,7 @@ class SystemInfoCollector:
                         "-Command",
                         "$cycle = Get-CimInstance -Namespace root\\wmi -Class BatteryCycleCount; if ($cycle -and $cycle.CycleCount -ge 0) { $cycle.CycleCount }"
                     ]
-                    cycle_proc = subprocess.run(cycle_command, capture_output=True, text=True, check=True, shell=False)
+                    cycle_proc = run_quiet_subprocess(cycle_command, capture_output=True, text=True, check=True, shell=False)
                     cycle_output = cycle_proc.stdout.strip()
                     if cycle_output:
                         payload["cycle_count"] = self._extract_number(cycle_output)
@@ -1784,7 +1803,7 @@ class SystemInfoCollector:
 
         try:
             command = ["system_profiler", "SPHardwareDataType", "-json"]
-            process = subprocess.run(command, capture_output=True, text=True, check=True, timeout=8)
+            process = run_quiet_subprocess(command, capture_output=True, text=True, check=True, timeout=8)
             hardware_data = json.loads(process.stdout)
 
             if hardware_data and hardware_data.get("SPHardwareDataType"):
@@ -1809,7 +1828,7 @@ class SystemInfoCollector:
                         payload["System Serial Number"] = serial_match.group(1)
 
             if not self._sanitize_identifier(payload.get("Hardware UUID")):
-                ioreg_uuid_output = subprocess.run(
+                ioreg_uuid_output = run_quiet_subprocess(
                     ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                     capture_output=True,
                     text=True,
@@ -1996,8 +2015,8 @@ class SystemInfoCollector:
         timeout: int = 5
     ) -> Optional[str]:
         try:
-            result = subprocess.run(
-                command if shell else command,
+            result = run_quiet_subprocess(
+                command,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -2137,7 +2156,7 @@ class SystemInfoCollector:
                 self.logger.log("[DEBUG-SIC-Windows] Attempting to list disk drives with wmic.")
                 # Use CSV format for more reliable parsing
                 command = ["wmic", "diskdrive", "get", "Caption,SerialNumber,MediaType,Size", "/format:csv"]
-                process = subprocess.run(command, capture_output=True, text=True, check=True, shell=True)
+                process = run_quiet_subprocess(command, capture_output=True, text=True, check=True, shell=True)
                 self.logger.log(f"[DEBUG-SIC-Windows] wmic stdout:\n{process.stdout}")
                 if process.stderr: 
                     self.logger.log(f"[DEBUG-SIC-Windows] wmic stderr:\n{process.stderr}")
@@ -2153,7 +2172,7 @@ class SystemInfoCollector:
                     self.logger.log("[DEBUG-SIC-Windows] No disk data found in wmic output")
                     # Fallback: try alternative command format
                     command_alt = ["wmic", "diskdrive", "get", "Caption,SerialNumber,MediaType,Size"]
-                    process_alt = subprocess.run(command_alt, capture_output=True, text=True, check=True, shell=True)
+                    process_alt = run_quiet_subprocess(command_alt, capture_output=True, text=True, check=True, shell=True)
                     output_alt = process_alt.stdout.strip()
                     
                     # Parse space-separated output
@@ -2271,7 +2290,7 @@ class SystemInfoCollector:
                 try:
                     ps_command = ["powershell", "-Command", 
                                 "Get-PhysicalDisk | Select-Object DeviceID, FriendlyName, SerialNumber, MediaType, Size | ConvertTo-Json"]
-                    ps_process = subprocess.run(ps_command, capture_output=True, text=True, check=True, shell=True)
+                    ps_process = run_quiet_subprocess(ps_command, capture_output=True, text=True, check=True, shell=True)
                     ps_output = ps_process.stdout.strip()
                     
                     if ps_output:
@@ -5298,14 +5317,18 @@ def initialize_application():
         def load_nlp_models():
             try:
                 logger.info("Preloading NLP models...")
-                import spacy
+                import keybert
                 from sentence_transformers import SentenceTransformer
-                from keybert import KeyBERT
-                
-                # Load models
-                spacy.load("en_core_web_sm")
+                import spacy
+
+                # Load spaCy model and ensure custom pipeline is available
+                nlp = spacy.load("en_core_web_sm", disable=["textcat", "ner"])
+                ensure_sensitive_info_component(nlp)
+
+                # Warm up heavy models so first-run latency is hidden from the GUI thread
                 SentenceTransformer('all-MiniLM-L6-v2')
-                KeyBERT()
+                keybert.KeyBERT()
+
                 logger.info("NLP models loaded successfully")
             except Exception as e:
                 logger.error(f"Error loading NLP models: {e}")
