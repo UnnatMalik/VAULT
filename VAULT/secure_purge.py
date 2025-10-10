@@ -84,6 +84,7 @@ from matplotlib.figure import Figure
 import re # Added for regex in macOS disk detection
 
 from PySide6.QtWidgets import QApplication, QTextEdit
+from PySide6.QtGui import QPalette, QColor
 
 
 def _is_gui_launch(argv: List[str]) -> bool:
@@ -141,6 +142,44 @@ def run_quiet_subprocess(command: Union[List[str], str], **kwargs) -> subprocess
         kwargs["creationflags"] = kwargs.get("creationflags", 0) | create_no_window
 
     return subprocess.run(command, **kwargs)
+
+
+# ---------------------
+# GUI theme configuration
+# ---------------------
+def configure_dark_theme(app: QApplication) -> None:
+    """Force a consistent dark theme across Windows, macOS, and Linux."""
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    background = QColor(14, 17, 22)
+    panel = QColor(20, 22, 23)
+    card = QColor(26, 29, 33)
+    text_primary = QColor(230, 230, 230)
+    text_muted = QColor(154, 160, 166)
+    accent_blue = QColor(58, 122, 254)
+
+    palette.setColor(QPalette.Window, background)
+    palette.setColor(QPalette.WindowText, text_primary)
+    palette.setColor(QPalette.Base, card)
+    palette.setColor(QPalette.AlternateBase, panel)
+    palette.setColor(QPalette.ToolTipBase, panel)
+    palette.setColor(QPalette.ToolTipText, text_primary)
+    palette.setColor(QPalette.Text, text_primary)
+    palette.setColor(QPalette.Button, panel)
+    palette.setColor(QPalette.ButtonText, text_primary)
+    palette.setColor(QPalette.BrightText, QColor(255, 59, 48))
+    palette.setColor(QPalette.Highlight, accent_blue.darker(120))
+    palette.setColor(QPalette.HighlightedText, text_primary)
+
+    palette.setColor(QPalette.Disabled, QPalette.Text, text_muted)
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, text_muted)
+    palette.setColor(QPalette.Disabled, QPalette.WindowText, text_muted)
+
+    app.setPalette(palette)
+    app.setStyleSheet(
+        "QToolTip { color: #E6E6E6; background-color: #1A1D21; border: 1px solid #333333; }"
+    )
 
 
 # ---------------------
@@ -5359,6 +5398,7 @@ if __name__ == "__main__":
         # Import here to avoid circular dependency
         from gui_components import SecureDeleteGUI
         app = QApplication(sys.argv)
+        configure_dark_theme(app)
         gui = SecureDeleteGUI()
         gui.show()
         sys.exit(app.exec())
