@@ -22,6 +22,7 @@ VAULT is a comprehensive, enterprise-grade system designed for **secure data pur
 - [API Reference](#api-reference)
 - [Security Considerations](#security-considerations)
 - [Contributing](#contributing)
+- [Future Scope Features](#future-scope-features)
 
 ---
 
@@ -412,6 +413,17 @@ python -m pytest --cov=src tests/
 - **PyTorch Team** - Deep learning infrastructure
 - **ReportLab** - Professional PDF generation
 - **Open Source Community** - Countless libraries and tools
+
+---
+
+## Future Scope Features
+
+This section outlines potential future enhancements for the secure file deletion tool:
+
+*   **Secure Backup Before Deletion**: Implement an option to create encrypted backups of files before they are securely deleted. This provides an additional layer of data recovery while maintaining security.
+*   **Network Share Support**: Extend functionality to securely wipe files from network shares, ensuring data sanitization even on remote storage.
+*   **Distributed Deletion**: Develop capabilities to coordinate secure deletion operations across multiple networked systems, ideal for enterprise environments.
+*   **Bandwidth Throttling**: Introduce controls to limit network bandwidth usage during distributed deletion operations, minimizing impact on network performance.
 
 ---
 
