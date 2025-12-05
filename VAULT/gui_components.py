@@ -1574,37 +1574,100 @@ class CleaningTab(QWidget):
         self._content_layout.addWidget(self.devices_group, 2)
 
         # --- Wipe Operation Section ---
-        wipe_operation_group = QGroupBox("Wipe Operation")
+        wipe_operation_group = QGroupBox("Secure Wipe Zone")
         wipe_operation_group.setObjectName("cleanSectionGroup")
         wipe_operation_layout = QVBoxLayout()
-        wipe_operation_layout.setContentsMargins(14, 12, 14, 16)
-        wipe_operation_layout.setSpacing(12)
+        wipe_operation_layout.setContentsMargins(20, 24, 20, 24)
+        wipe_operation_layout.setSpacing(16)
 
-        self.selected_device_label = QLabel("Selected Device: None")
-        self.selected_device_label.setObjectName("cleanSelectedDevice")
-        wipe_operation_layout.addWidget(self.selected_device_label)
+        # Device Info Card
+        self.device_info_card = QFrame()
+        self.device_info_card.setObjectName("deviceInfoCard")
+        self.device_info_card.setStyleSheet(f"""
+            QFrame#deviceInfoCard {{
+                background-color: {APP_COLORS["background"]};
+                border: 1px solid {APP_COLORS["border"]};
+                border-radius: 12px;
+            }}
+        """)
+        card_layout = QVBoxLayout(self.device_info_card)
+        card_layout.setContentsMargins(16, 16, 16, 16)
+        card_layout.setSpacing(8)
 
-        self.selected_device_details_label = QLabel("Path: -, Model: -, Serial: -, Size: -")
-        self.selected_device_details_label.setObjectName("cleanDeviceDetails")
-        wipe_operation_layout.addWidget(self.selected_device_details_label)
+        target_label = QLabel("TARGET DEVICE")
+        target_label.setStyleSheet(f"color: {APP_COLORS['text_muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
+        card_layout.addWidget(target_label)
 
-        form_layout = QFormLayout()
-        form_layout.setLabelAlignment(Qt.AlignLeft)
-        form_layout.setFormAlignment(Qt.AlignTop)
-        form_layout.setHorizontalSpacing(28)
-        form_layout.setVerticalSpacing(10)
-        confirm_label = QLabel("CONFIRM")
-        confirm_label.setObjectName("cleanFormLabel")
+        self.selected_device_path_label = QLabel("No Device Selected")
+        self.selected_device_path_label.setStyleSheet(f"color: {APP_COLORS['text_primary']}; font-size: 20px; font-weight: 700; font-family: {APP_FONT_FAMILY}; letter-spacing: 0.5px;")
+        card_layout.addWidget(self.selected_device_path_label)
+
+        self.selected_device_details_label = QLabel("Select a device from the list above to proceed.")
+        self.selected_device_details_label.setStyleSheet(f"color: {APP_COLORS['text_muted']}; font-size: 13px;")
+        self.selected_device_details_label.setWordWrap(True)
+        card_layout.addWidget(self.selected_device_details_label)
+        
+        wipe_operation_layout.addWidget(self.device_info_card)
+
+        # Confirmation & Action
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(16)
+
         self.confirmation_input = QLineEdit()
-        self.confirmation_input.setPlaceholderText("Type 'WIPE' or device serial")
-        form_layout.addRow(confirm_label, self.confirmation_input)
-        wipe_operation_layout.addLayout(form_layout)
+        self.confirmation_input.setPlaceholderText("Type 'WIPE' to confirm")
+        self.confirmation_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {APP_COLORS["background"]};
+                border: 1px solid {APP_COLORS["border"]};
+                border-radius: 8px;
+                padding: 10px;
+                color: {APP_COLORS["text_primary"]};
+                font-family: {APP_FONT_FAMILY};
+                font-weight: 600;
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {APP_COLORS["signal_red"]};
+            }}
+        """)
+        action_layout.addWidget(self.confirmation_input, 1)
 
-        self.start_wipe_button = QPushButton("Start Wipe")
-        self.start_wipe_button.setObjectName("primaryActionButton")
+        self.start_wipe_button = QPushButton("INITIATE WIPE")
+        self.start_wipe_button.setObjectName("dangerButton")
         self.start_wipe_button.setEnabled(False)
+        self.start_wipe_button.setCursor(Qt.PointingHandCursor)
+        self.start_wipe_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {APP_COLORS["signal_red"]};
+                border: none;
+                border-radius: 8px;
+                padding: 10px 24px;
+                color: #FFFFFF;
+                font-weight: 700;
+                font-size: 13px;
+                letter-spacing: 0.5px;
+            }}
+            QPushButton:hover {{
+                background-color: #FF5E55;
+            }}
+            QPushButton:pressed {{
+                background-color: #D32F2F;
+            }}
+            QPushButton:disabled {{
+                background-color: #3A2020;
+                color: #664444;
+            }}
+        """)
         self.start_wipe_button.clicked.connect(self._start_device_wipe)
-        wipe_operation_layout.addWidget(self.start_wipe_button)
+        action_layout.addWidget(self.start_wipe_button)
+
+        wipe_operation_layout.addLayout(action_layout)
+        
+        # Warning Text
+        warning_label = QLabel("⚠ Warning: This action is irreversible and will permanently erase all data on the selected device.")
+        warning_label.setStyleSheet(f"color: {APP_COLORS['signal_amber']}; font-size: 11px; margin-top: 4px;")
+        warning_label.setAlignment(Qt.AlignCenter)
+        wipe_operation_layout.addWidget(warning_label)
 
         wipe_operation_group.setLayout(wipe_operation_layout)
         self._content_layout.addWidget(wipe_operation_group)
@@ -1786,7 +1849,7 @@ class CleaningTab(QWidget):
 
         self.device_table.setUpdatesEnabled(True)
         self.device_table.blockSignals(False)
-        self.device_table.resizeColumnsToContents()
+        # self.device_table.resizeColumnsToContents() # Disabled to fix alignment bug
         self.device_table.viewport().update()
         self.device_table.verticalScrollBar().setValue(0)
         self.device_table.clearSelection()
@@ -1804,7 +1867,7 @@ class CleaningTab(QWidget):
         else:
             self.metric_cards["devices"].setText("Scanning...")
 
-        self.refresh_button.setEnabled(False)
+        # self.refresh_button.setEnabled(False) # Disabled to prevent focus jump
         self.refresh_button.setText("Refreshing…")
 
         self._device_thread = QThread()
@@ -1826,7 +1889,7 @@ class CleaningTab(QWidget):
         self._device_worker = None
 
     def _on_device_refresh_finished(self, disks: list, error_msg: str):
-        self.refresh_button.setEnabled(True)
+        # self.refresh_button.setEnabled(True) # Not needed as we didn't disable it
         self.refresh_button.setText(self._refresh_button_default_text)
 
         if error_msg:
@@ -1854,8 +1917,8 @@ class CleaningTab(QWidget):
             size = self.device_table.item(row, 4).text()
 
             self.selected_device_path = path
-            self.selected_device_label.setText(f"Selected Device: {path}")
-            self.selected_device_details_label.setText(f"Path: {path}, Model: {model}, Serial: {serial}, Type: {disk_type}, Size: {size}")
+            self.selected_device_path_label.setText(path)
+            self.selected_device_details_label.setText(f"{model} • {serial} • {size} • {disk_type}")
             self.start_wipe_button.setEnabled(False) # Re-disable until confirmation
             self.confirmation_input.setText("") # Clear confirmation input
             # Disconnect previous connection before connecting to avoid multiple connections
@@ -1866,8 +1929,8 @@ class CleaningTab(QWidget):
             self.confirmation_input.textChanged.connect(self._check_wipe_confirmation) # Connect for live check
         else:
             self.selected_device_path = None
-            self.selected_device_label.setText("Selected Device: None")
-            self.selected_device_details_label.setText("Path: -, Model: -, Serial: -, Size: -")
+            self.selected_device_path_label.setText("No Device Selected")
+            self.selected_device_details_label.setText("Select a device from the list above to proceed.")
             self.start_wipe_button.setEnabled(False)
             try:
                 self.confirmation_input.textChanged.disconnect(self._check_wipe_confirmation) # Disconnect if no device
