@@ -21,7 +21,7 @@ torchvision
 sentence-transformers
 keybert
 pandas
-python-magic-bin
+python-magic
 chardet
 pyinstaller
 wheel
