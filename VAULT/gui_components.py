@@ -2914,6 +2914,8 @@ class SecureDeleteGUI(QWidget):
         return self.current_passes_value
 
 
+import time
+
 # The `DeleteWorker` class in Python defines a worker object that performs secure file deletion with
 # specified passes and emits signals for logging and completion with a unique wipe job ID.
 class DeleteWorker(QObject):
@@ -2926,15 +2928,27 @@ class DeleteWorker(QObject):
         self.passes = int(passes)
         self.db_manager = db_manager
         self.wipe_job_id = wipe_job_id
+        self._log_buffer = []
+        self._last_emit_time = time.time()
 
     def _emit(self, message: str):
-        self.log.emit(message)
+        self._log_buffer.append(message)
+        now = time.time()
+        if now - self._last_emit_time >= 0.1:
+            self.log.emit("\n".join(self._log_buffer))
+            self._log_buffer.clear()
+            self._last_emit_time = now
 
     def _append_manifest_entry(self, abs_path: Path, sha256: str):
         self.db_manager.add_entry(abs_path, sha256)
 
     def run(self):
-        finished_emitter = lambda success, message: self.finished.emit(success, message, self.wipe_job_id) # Pass wipe_job_id
+        def finished_emitter(success, message):
+            if self._log_buffer:
+                self.log.emit("\n".join(self._log_buffer))
+                self._log_buffer.clear()
+            self.finished.emit(success, message, self.wipe_job_id)
+
         _perform_secure_purge_logic(self.target, self.passes, self.db_manager, self._emit, finished_emitter, self.wipe_job_id)
 
 

@@ -2416,15 +2416,27 @@ class SystemInfoCollector:
 
 
 
+from PySide6.QtCore import QTimer
+
 class Logger:
     def __init__(self, widget: QTextEdit):
         self.widget = widget
+        self._buffer = []
+        self._timer = QTimer(widget)
+        self._timer.timeout.connect(self._flush)
+        self._timer.start(100) # Flush every 100ms
 
     def log(self, msg: str):
-        now = datetime.utcnow().isoformat(sep=" ", timespec="seconds")
-        line = f"{now} | {msg}"
-        print(line)
-        self.widget.append(line)
+        now = datetime.now(UTC).isoformat(sep=" ", timespec="seconds")
+        for m in str(msg).split("\n"):
+            line = f"{now} | {m}"
+            print(line)
+            self._buffer.append(line)
+
+    def _flush(self):
+        if self._buffer:
+            self.widget.append("\n".join(self._buffer))
+            self._buffer.clear()
 
 class LogDatabaseManager:
     def __init__(self, db_path: Path):
@@ -4748,7 +4760,7 @@ class WipeOrchestratorMCP:
 def hash_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):  # 1MB chunks for speed
             h.update(chunk)
     return h.hexdigest()
 
@@ -4877,7 +4889,7 @@ def _analyze_before_deletion(p: Path, log_callback: Callable) -> Dict[str, Any]:
         }
 
 def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Callable, 
-                                       use_distributed: bool = True, analyze_content: bool = True) -> bool:
+                                       use_distributed: bool = True, analyze_content: bool = False) -> bool:
     """
     Overwrite file at p in chunked mode for given passes and then unlink.
     Uses distributed processing if use_distributed is True, otherwise falls back to single-threaded.
@@ -4887,7 +4899,7 @@ def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Ca
         passes: Number of overwrite passes
         log_callback: Function to log messages
         use_distributed: Whether to use distributed processing for large files
-        analyze_content: Whether to analyze file content before deletion
+        analyze_content: Whether to analyze file content before deletion (disabled by default for performance)
         
     Returns:
         bool: True if deletion was successful, False otherwise
@@ -4900,11 +4912,16 @@ def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Ca
             log_callback(f"[!] File does not exist: {p}")
             return False
             
-        # Analyze content before deletion if requested
+        # Content analysis is disabled by default for performance.
+        # Loading spaCy, KeyBERT, and SentenceTransformer models per-file
+        # was the primary cause of system hangs during purge.
         analysis_result = {}
-        if analyze_content and file_size < 100 * 1024 * 1024:  # Don't analyze files > 100MB
-            log_callback(f"[i] Analyzing content of {p.name}...")
-            analysis_result = _analyze_before_deletion(p, log_callback)
+        if analyze_content and file_size < 10 * 1024 * 1024:  # Only analyze small files < 10MB
+            try:
+                log_callback(f"[i] Analyzing content of {p.name}...")
+                analysis_result = _analyze_before_deletion(p, log_callback)
+            except Exception as ae:
+                log_callback(f"[!] Content analysis skipped due to error: {ae}")
         
         # Handle empty files
         if file_size == 0:
@@ -4943,7 +4960,16 @@ def _distributed_secure_wipe(p: Path, passes: int, log_callback) -> bool:
             last_progress = 0
             start_time = time.time()
             
+            timeout_seconds = 30 * 60  # 30 minute timeout for safety
+            last_log_time = start_time
+            
             while True:
+                # Check for timeout to prevent infinite loop
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    log_callback(f"[!] Distributed wipe timed out after {elapsed/60:.1f} minutes")
+                    return False
+                
                 # Process results
                 results = manager.process_results(timeout=0.5)
                 
@@ -4954,7 +4980,6 @@ def _distributed_secure_wipe(p: Path, passes: int, log_callback) -> bool:
                     if task_id in results:
                         task = results[task_id]
                         if task['status'] == 'completed':
-                            elapsed = time.time() - start_time
                             speed = task['total_size'] * task['passes'] / (elapsed + 1e-6) / (1024*1024)  # MB/s
                             log_callback(f"[✓] Successfully wiped {p} in {elapsed:.1f}s ({speed:.1f} MB/s)")
                             
@@ -4970,10 +4995,10 @@ def _distributed_secure_wipe(p: Path, passes: int, log_callback) -> bool:
                         log_callback("[!] Wipe task disappeared unexpectedly")
                         return False
                 
-                # Update progress if changed
+                # Throttle progress updates to every 5% or every 2 seconds
                 progress = (task['processed_size'] / (task['total_size'] * task['passes'])) * 100
-                if progress > last_progress + 1.0:  # Update at most every 1%
-                    elapsed = time.time() - start_time
+                now = time.time()
+                if progress > last_progress + 5.0 or (now - last_log_time) > 2.0:
                     speed = task['processed_size'] / (elapsed + 1e-6) / (1024*1024)  # MB/s
                     remaining = (100 - progress) * (elapsed / max(1, progress)) if progress > 0 else 0
                     
@@ -4984,8 +5009,9 @@ def _distributed_secure_wipe(p: Path, passes: int, log_callback) -> bool:
                         f"Remaining: {remaining/60:.1f}m"
                     )
                     last_progress = progress
+                    last_log_time = now
                 
-                time.sleep(0.1)
+                time.sleep(0.2)
                 
     except Exception as e:
         log_callback(f"[!] Distributed wipe failed: {e}")
@@ -4999,6 +5025,9 @@ def _single_threaded_secure_wipe(p: Path, passes: int, log_callback) -> bool:
         
         start_time = time.time()
         
+        last_log_progress = 0
+        last_log_time = start_time
+        
         # Overwrite file with random data
         for pass_num in range(passes):
             log_callback(f"[i] Pass {pass_num + 1}/{passes} for {p}")
@@ -5011,19 +5040,23 @@ def _single_threaded_secure_wipe(p: Path, passes: int, log_callback) -> bool:
                     f.write(os.urandom(chunk_size))
                     remaining -= chunk_size
                     
-                    # Update progress
+                    # Throttle progress updates to every 5% or every 2 seconds
                     progress = ((pass_num * file_size + (file_size - remaining)) / 
                               (passes * file_size)) * 100
-                    elapsed = time.time() - start_time
-                    speed = (pass_num * file_size + (file_size - remaining)) / (elapsed + 1e-6) / (1024*1024)
-                    remaining_time = (100 - progress) * (elapsed / max(1, progress)) if progress > 0 else 0
-                    
-                    log_callback(
-                        f"[i] Wiping {p.name}: {progress:.1f}% | "
-                        f"Pass {pass_num + 1}/{passes} | "
-                        f"Speed: {speed:.1f} MB/s | "
-                        f"Remaining: {remaining_time/60:.1f}m"
-                    )
+                    now = time.time()
+                    if progress > last_log_progress + 5.0 or (now - last_log_time) > 2.0:
+                        elapsed = time.time() - start_time
+                        speed = (pass_num * file_size + (file_size - remaining)) / (elapsed + 1e-6) / (1024*1024)
+                        remaining_time = (100 - progress) * (elapsed / max(1, progress)) if progress > 0 else 0
+                        
+                        log_callback(
+                            f"[i] Wiping {p.name}: {progress:.1f}% | "
+                            f"Pass {pass_num + 1}/{passes} | "
+                            f"Speed: {speed:.1f} MB/s | "
+                            f"Remaining: {remaining_time/60:.1f}m"
+                        )
+                        last_log_progress = progress
+                        last_log_time = now
                 
                 f.flush()
                 os.fsync(f.fileno())
