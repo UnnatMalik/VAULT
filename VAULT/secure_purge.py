@@ -46,17 +46,16 @@ import io
 import argparse
 from copy import deepcopy
 
-# Import analysis components
+
 from content_analyzer import ContentAnalyzer, ContentType
 
-# Import distributed processing
+
 from distributed_worker import DistributedWipeManager, ChunkInfo, WorkerResult
 
 from reportlab.lib.enums import TA_LEFT
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import ParagraphStyle
 
-# For digital signing - NEW: RSA instead of ECDSA
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import BestAvailableEncryption, NoEncryption
@@ -66,18 +65,17 @@ from cryptography.hazmat.backends import default_backend
 import qrcode
 
 
-from reportlab.lib.pagesizes import letter, LETTER # Added LETTER for consistency with new code
+from reportlab.lib.pagesizes import letter, LETTER 
 
 
 VAULT_VERIFY_PORTAL_URL = "https://vault-lime.vercel.app"
-from reportlab.pdfgen import canvas # Added for new PDF generation method
-from PIL import Image # Added for logo handling in new PDF generation
-from reportlab.lib.utils import ImageReader # Added for embedding QR code directly
+from reportlab.pdfgen import canvas 
+from PIL import Image 
+from reportlab.lib.utils import ImageReader 
 
-# Import MetadataWorker from metadata_worker.py (existing)
+
 from metadata_worker import MetadataWorker
 
-# For matplotlib integration (existing)
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
