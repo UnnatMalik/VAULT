@@ -4854,10 +4854,35 @@ def _perform_secure_purge_logic(target: Path, passes: int, db_manager: LogDataba
         log_callback(f"[ERR] Worker exception: {e}")
         finished_callback(False, f"Worker error: {e}")
 
+# Module-level cached ContentAnalyzer instance.
+# Loading spaCy, KeyBERT, and SentenceTransformer models is extremely expensive
+# (~5-15 seconds). By caching the instance, we pay this cost only once on first
+# use rather than on every single file during a purge operation.
+_cached_content_analyzer = None
+_analyzer_init_failed = False
+
+def _get_content_analyzer():
+    """Get or create the cached ContentAnalyzer singleton."""
+    global _cached_content_analyzer, _analyzer_init_failed
+    if _analyzer_init_failed:
+        return None
+    if _cached_content_analyzer is None:
+        try:
+            _cached_content_analyzer = ContentAnalyzer()
+        except Exception as e:
+            _analyzer_init_failed = True
+            logging.getLogger(__name__).warning(f"ContentAnalyzer init failed (will skip analysis): {e}")
+            return None
+    return _cached_content_analyzer
+
 def _analyze_before_deletion(p: Path, log_callback: Callable) -> Dict[str, Any]:
     """Analyze file content before deletion and return analysis results."""
     try:
-        analyzer = ContentAnalyzer()
+        analyzer = _get_content_analyzer()
+        if analyzer is None:
+            log_callback(f"[!] Content analyzer unavailable, skipping analysis for {p.name}")
+            return {'error': 'ContentAnalyzer not available', 'file_size': p.stat().st_size if p.exists() else 0}
+        
         analysis = analyzer.analyze_file(str(p))
         
         # Log sensitive information if found
@@ -4881,7 +4906,6 @@ def _analyze_before_deletion(p: Path, log_callback: Callable) -> Dict[str, Any]:
         }
     except Exception as e:
         log_callback(f"[!] Error during content analysis: {e}")
-        log_callback(traceback.format_exc())
         return {
             'error': str(e),
             'file_size': p.stat().st_size if p.exists() else 0,
@@ -4889,7 +4913,7 @@ def _analyze_before_deletion(p: Path, log_callback: Callable) -> Dict[str, Any]:
         }
 
 def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Callable, 
-                                       use_distributed: bool = True, analyze_content: bool = False) -> bool:
+                                       use_distributed: bool = True, analyze_content: bool = True) -> bool:
     """
     Overwrite file at p in chunked mode for given passes and then unlink.
     Uses distributed processing if use_distributed is True, otherwise falls back to single-threaded.
@@ -4899,7 +4923,7 @@ def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Ca
         passes: Number of overwrite passes
         log_callback: Function to log messages
         use_distributed: Whether to use distributed processing for large files
-        analyze_content: Whether to analyze file content before deletion (disabled by default for performance)
+        analyze_content: Whether to analyze file content before deletion
         
     Returns:
         bool: True if deletion was successful, False otherwise
@@ -4912,11 +4936,10 @@ def _secure_overwrite_and_delete_internal(p: Path, passes: int, log_callback: Ca
             log_callback(f"[!] File does not exist: {p}")
             return False
             
-        # Content analysis is disabled by default for performance.
-        # Loading spaCy, KeyBERT, and SentenceTransformer models per-file
-        # was the primary cause of system hangs during purge.
+        # Analyze content before deletion using the cached ContentAnalyzer singleton.
+        # Models are loaded only once on first use, so this is fast for subsequent files.
         analysis_result = {}
-        if analyze_content and file_size < 10 * 1024 * 1024:  # Only analyze small files < 10MB
+        if analyze_content and file_size < 100 * 1024 * 1024:  # Don't analyze files > 100MB
             try:
                 log_callback(f"[i] Analyzing content of {p.name}...")
                 analysis_result = _analyze_before_deletion(p, log_callback)
