@@ -3172,16 +3172,32 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error caching analysis: {e}")
 
-# Register custom pipeline components without spaCy's decorator so it works in frozen builds
-def sensitive_info_component(doc: Doc) -> Doc:
-    """Custom pipeline component to detect sensitive information."""
-    # This is a placeholder. In a real implementation, you'd add more sophisticated
-    # detection logic here.
-    return doc
-
-
 def ensure_sensitive_info_component(nlp: Language) -> None:
     """Add the sensitive info component to the pipeline if it's not already present."""
     if 'sensitive_info' in nlp.pipe_names:
         return
-    nlp.add_pipe(sensitive_info_component, name='sensitive_info', before='parser')
+        
+    # In spaCy v3, components must be added by string name after being registered via the decorator.
+    # To be extremely robust, especially for frozen builds (like PyInstaller) where 
+    # module-level decorators might not trigger as expected, we ensure it's registered
+    # in the global Language factories right here if it's missing.
+    if not hasattr(Language, 'has_factory') or not Language.has_factory('sensitive_info'):
+        @Language.component('sensitive_info')
+        def dynamic_sensitive_info_component(doc):
+            """Custom pipeline component to detect sensitive information."""
+            return doc
+
+    # Safely insert the component before 'parser' if possible.
+    try:
+        if 'parser' in nlp.pipe_names:
+            nlp.add_pipe('sensitive_info', before='parser')
+        else:
+            nlp.add_pipe('sensitive_info')
+    except Exception as e:
+        logger.warning(f"Failed to add 'sensitive_info' component before parser. Error: {e}")
+        try:
+            # Fallback to appending to the pipeline directly
+            nlp.add_pipe('sensitive_info')
+        except Exception:
+            pass
+

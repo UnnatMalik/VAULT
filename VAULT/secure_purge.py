@@ -244,8 +244,8 @@ class ConsoleLogger:
         print(line)
 
 # Helper function for drawing multiline text (moved to global scope)
-def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max_width, line_height):
-    """Draw multiline text with manual wrapping to avoid overlap issues."""
+def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max_width, line_height, page_height=None):
+    """Draw multiline text with manual wrapping and automatic page breaks to avoid truncation."""
     if text is None:
         return 0
 
@@ -256,14 +256,25 @@ def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max
     canvas_obj.setFont(font_name, font_size)
     actual_line_height = max(line_height, int(font_size * 1.25))
 
+    # Use LETTER height as default if not provided
+    if page_height is None:
+        from reportlab.lib.pagesizes import LETTER as _LETTER
+        page_height = _LETTER[1]
+
+    def _new_page_if_needed():
+        nonlocal current_y
+        if current_y < 60:
+            canvas_obj.showPage()
+            current_y = page_height - 50
+            canvas_obj.setFont(font_name, font_size)
+
     # Split into paragraphs so that blank lines are respected
     paragraphs = content.split('\n')
     current_y = y_start
     total_height = 0
 
     for para in paragraphs:
-        if current_y < 60:
-            break
+        _new_page_if_needed()
 
         stripped = para.rstrip()
         if stripped == "":
@@ -281,12 +292,11 @@ def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max
             if canvas_obj.stringWidth(word, font_name, font_size) > max_width:
                 # Flush current line first
                 if line:
+                    _new_page_if_needed()
                     canvas_obj.drawString(x, current_y, line)
                     current_y -= actual_line_height
                     total_height += actual_line_height
                     line = ""
-                    if current_y < 60:
-                        break
 
                 # Split the long word into chunks
                 chunk = ""
@@ -295,14 +305,11 @@ def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max
                     if canvas_obj.stringWidth(test_chunk, font_name, font_size) <= max_width:
                         chunk = test_chunk
                     else:
+                        _new_page_if_needed()
                         canvas_obj.drawString(x, current_y, chunk)
                         current_y -= actual_line_height
                         total_height += actual_line_height
                         chunk = ch
-                        if current_y < 60:
-                            break
-                if current_y < 60:
-                    break
                 if chunk:
                     line = chunk
                 continue
@@ -312,17 +319,14 @@ def _draw_multiline_text(canvas_obj, text, x, y_start, font_name, font_size, max
                 line = candidate
             else:
                 if line:
+                    _new_page_if_needed()
                     canvas_obj.drawString(x, current_y, line)
                     current_y -= actual_line_height
                     total_height += actual_line_height
-                    if current_y < 60:
-                        break
                 line = word
 
-        if current_y < 60:
-            break
-
         if line:
+            _new_page_if_needed()
             canvas_obj.drawString(x, current_y, line)
             current_y -= actual_line_height
             total_height += actual_line_height
@@ -756,9 +760,9 @@ def generate_refurbish_report_pdf(out_path: Path, report_data: dict,):
 
     report_data = dict(report_data)
 
-    # Enhanced format_value function for refurbish report with proper truncation
+    # Enhanced format_value function for refurbish report — no truncation on critical values
     def format_value_refurbish(value, indent_level=0):
-        """Format values for refurbish report with truncation to prevent overflow"""
+        """Format values for refurbish report, preserving full content (wrapping handled by renderer)"""
         indent_str = "  " * indent_level
         
         if isinstance(value, (list, tuple)):
@@ -766,10 +770,10 @@ def generate_refurbish_report_pdf(out_path: Path, report_data: dict,):
                 return "None"
             formatted_items = []
             for i, item in enumerate(value):
-                if i >= 8:  # Limit list items
-                    formatted_items.append(f"{indent_str}- ... and {len(value) - 8} more items")
+                if i >= 15:  # Limit list items for readability
+                    formatted_items.append(f"{indent_str}- ... and {len(value) - 15} more items")
                     break
-                item_str = str(item)[:80]  # Truncate long items
+                item_str = str(item)
                 formatted_items.append(f"{indent_str}- {item_str}")
             return "\n".join(formatted_items)
             
@@ -778,28 +782,22 @@ def generate_refurbish_report_pdf(out_path: Path, report_data: dict,):
                 return "None"
             formatted_lines = []
             for i, (k, v) in enumerate(value.items()):
-                if i >= 12:  # Limit dict items
-                    formatted_lines.append(f"{indent_str}... and {len(value) - 12} more items")
+                if i >= 20:  # Limit dict items for readability
+                    formatted_lines.append(f"{indent_str}... and {len(value) - 20} more items")
                     break
                     
-                key_str = str(k)[:40]  # Truncate long keys
+                key_str = str(k)
                 if isinstance(v, (dict, list)):
                     formatted_lines.append(f"{indent_str}{key_str}:")
                     sub_value = format_value_refurbish(v, indent_level + 1)
-                    if len(sub_value) > 400:  # Truncate very long nested content
-                        sub_value = sub_value[:400] + "..."
                     formatted_lines.append(sub_value)
                 else:
-                    value_str = str(v)[:80]  # Truncate long values
+                    value_str = str(v)
                     formatted_lines.append(f"{indent_str}{key_str}: {value_str}")
             return "\n".join(formatted_lines)
             
         else:
-            # Handle long strings
-            value_str = str(value)
-            if len(value_str) > 150:
-                return value_str[:150] + "..."
-            return value_str
+            return str(value)
     
     # Compact format function specifically for logical disk information
     def format_logical_disks_compact(logical_disks):
