@@ -1996,6 +1996,7 @@ class CleaningTab(QWidget):
                     disk["Path"],
                     self.passes_spin_val_func(),
                     wipe_job_id,
+                    self.mcp_orchestrator,
                     mcp_console_logger,
                     is_system_wipe=True
                 )
@@ -2008,6 +2009,7 @@ class CleaningTab(QWidget):
                 self.selected_device_path,
                 self.passes_spin_val_func(),
                 wipe_job_id,
+                self.mcp_orchestrator,
                 mcp_console_logger,
                 is_system_wipe=False
             )
@@ -2078,8 +2080,8 @@ class CleaningTab(QWidget):
                 actual_result="SUCCESS",
                 verification_artifact="N/A" # Actual physical verification is complex, keep as N/A for now
             )
-            # Generate certificate for physical wipe
-            self.mcp_orchestrator._generate_and_store_certificates(wipe_job_id)
+            # Certificate generation is now handled inside PhysicalDeviceWipeWorker.run() on a background thread
+            pass
         else:
             QMessageBox.critical(self, "Physical Wipe Failed", f"{message}\n\nWipe ID: {wipe_job_id}") # Added wipe_job_id
             self.db_manager.update_wipe_job_status(
@@ -2126,53 +2128,65 @@ class CleaningTab(QWidget):
         if resp != QMessageBox.Yes:
             return
 
+        # Pre-flight check: Quickly scan for files needing manual review or special approvals
+        # This is fast enough to run on the main thread before dispatching heavy work.
+        valid_targets = []
+        for path_str in target_paths:
+            path = Path(path_str)
+            # Lightweight prediction check
+            prediction = self.mcp_orchestrator._predict_wipe_outcome(path, passes)
+            
+            if prediction["predicted_label"] == "MANUAL_REVIEW":
+                resp = QMessageBox.warning(
+                    self, "Manual Review Recommended",
+                    f"The AI model flagged {path.name} as highly sensitive:\n\n{prediction['explain']}\n\nDo you still want to proceed with secure deletion?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if resp != QMessageBox.Yes: continue
+                
+            if prediction["method"] == "physical_destroy":
+                QMessageBox.information(
+                    self, "Physical Destruction Required",
+                    f"The AI model recommends physical destruction for {path.name}. "
+                    "Please use the 'Secure Wipe Zone' for full disk destruction instead of targetted file purge."
+                )
+                continue
+                
+            valid_targets.append(path_str)
+
+        if not valid_targets:
+            self.logger.log("[i] No targets selected for background processing.")
+            return
+
+        # All heavy work (full assess, wipe, verify, certs) happens on the worker thread
         self._thread = QThread()
         self._workers = []
+        self._completed_wipe_ids = []
 
-        for target_path in target_paths:
-            assessment_result = self.mcp_orchestrator.assess_asset(Path(target_path), passes)
-            predicted_label = assessment_result["result"]["predicted_label"]
-            wipe_job_id = assessment_result["result"]["wipe_job_id"]
-
-            if predicted_label == "MANUAL_REVIEW":
-                QMessageBox.warning(self, "Manual Review Needed", f'The AI model recommends manual review for {target_path}:\n\n{assessment_result["result"]["explain"]}')
-                self.logger.log(f"[MCP] Operation halted for {target_path} due to manual review recommendation.")
-                continue
-
-            if assessment_result["result"]["method"] == "physical_destroy":
-                self.logger.log(f"[MCP] Requesting multi-party approval for physical_destroy on {target_path}.")
-                QMessageBox.information(self, "Approval Needed", f"Multi-party approval required for physical_destroy on {target_path}. Please get approval before proceeding.")
-                continue
-
-            if not self.mcp_orchestrator.start_wipe(wipe_job_id):
-                self.logger.log(f"[MCP-ERR] Failed to start wipe job {wipe_job_id} for {target_path}.")
-                QMessageBox.critical(self, "Error", f"Failed to initiate wipe job {wipe_job_id} through MCP for {target_path}.")
-                continue
-
-            worker = DeleteWorker(Path(target_path), passes, self.db_manager, wipe_job_id)
-            worker.assessment_result = assessment_result # Store to use later
+        for target_path in valid_targets:
+            worker = DeleteWorker(
+                Path(target_path), passes, self.db_manager,
+                self.mcp_orchestrator
+            )
             self._workers.append(worker)
-
-        if not self._workers:
-            self.logger.log("[i] No valid targets to wipe after processing.")
-            return
 
         for worker in self._workers:
             worker.moveToThread(self._thread)
-            worker.log.connect(self._log_from_worker, Qt.QueuedConnection) # Connect worker's log signal directly to CleaningTab's logger
+            worker.log.connect(self._log_from_worker, Qt.QueuedConnection)
             worker.finished.connect(
-                lambda success, message, wid=worker.wipe_job_id, logs=worker.assessment_result["mcp_logs"], w=worker: 
+                lambda success, message, wid, logs, w=worker: 
                     self._on_worker_finished_mcp(wid, success, message, logs, w),
                 Qt.QueuedConnection
             )
 
-        # Chain the workers
+        # Chain the workers sequentially (lambda absorbs the signal args)
         for i in range(len(self._workers) - 1):
-            self._workers[i].finished.connect(self._workers[i+1].run)
+            next_worker = self._workers[i + 1]
+            self._workers[i].finished.connect(lambda *_args, w=next_worker: w.run())
 
         # Connect cleanup to the last worker
-        self._workers[-1].finished.connect(self._thread.quit)
-        self._workers[-1].finished.connect(lambda: [w.deleteLater() for w in self._workers])
+        self._workers[-1].finished.connect(lambda *_args: self._thread.quit())
+        self._workers[-1].finished.connect(lambda *_args: [w.deleteLater() for w in self._workers])
         self._thread.finished.connect(self._thread.deleteLater)
 
         self._thread.started.connect(self._workers[0].run)
@@ -2180,13 +2194,10 @@ class CleaningTab(QWidget):
         
         self._set_last_action("Secure delete running")
         self.logger.log(f"[i] Started secure purge for {len(self._workers)} target(s)")
-        self._completed_wipe_ids = []
 
     def _on_worker_finished_mcp(self, wipe_job_id: str, success: bool, message: str, mcp_buffered_logs: list, worker=None):
-        actual_result = "SUCCESS" if success else "FAILURE"
-        verification_artifact = f"SimulatedVerificationArtifact_{uuid.uuid4()}"
-        is_signed = True
-        self.mcp_orchestrator.verify_wipe(wipe_job_id, verification_artifact, is_signed, actual_result)
+        # verify_wipe + certificate generation is now handled inside DeleteWorker.run()
+        # This callback only updates the UI (lightweight, no blocking work)
         self.logger.log(f"[i] File Worker finished: {message}")
 
         # Track completed wipe IDs
@@ -2212,16 +2223,44 @@ class CleaningTab(QWidget):
         self._set_last_action("Secure delete done" if success else "Secure delete failed")
 
     def verify_manifest(self):
-        results = verify_manifest_deletions(self.db_manager, self.logger)
+        if self._thread and self._thread.isRunning():
+            self.logger.log("[warn] Another operation is already in progress.")
+            return
+
+        self.logger.log("[i] Starting manifest verification asynchronously...")
+        self._thread = QThread()
+        self._verify_worker = VerificationWorker(self.db_manager)
+        self._verify_worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._verify_worker.run)
+        self._verify_worker.log.connect(self._log_from_worker, Qt.QueuedConnection)
+        self._verify_worker.finished.connect(self._on_verification_finished, Qt.QueuedConnection)
+        self._verify_worker.finished.connect(self._thread.quit)
+        self._verify_worker.finished.connect(self._verify_worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+
+        self._thread.start()
+        self._set_last_action("Verifying manifest")
+
+    def _on_verification_finished(self, results: list):
+        if not results:
+            QMessageBox.information(self, "Verification", "Manifest empty or unreadable.")
+            self.logger.log("[i] Manifest empty or unreadable (see logs for errors).")
+            return
+            
         missing = [r for r in results if r[1] == "MISSING"]
         present = [r for r in results if r[1].startswith("PRESENT")]
-        if not results:
-            QMessageBox.information(self, "Verification", "Manifest empty or unreadable (see logs).")
-            self.logger.log("[i] Manifest empty or unreadable.") # Log to CleaningTab's logger
-            return
-        summary = f"Total entries checked: {len(results)}\nMissing (expected deleted): {len(missing)}\nPresent (unexpected): {len(present)}"
+        
+        summary = (
+            f"Verification Complete:\n\n"
+            f"Total entries: {len(results)}\n"
+            f"Expectedly missing (deleted): {len(missing)}\n"
+            f"Unexpectedly present: {len(present)}"
+        )
+        
         QMessageBox.information(self, "Verification Summary", summary)
-        self.logger.log(summary) # Log to CleaningTab's logger
+        log_summary = summary.replace('\n\n', ' • ').replace('\n', ' • ')
+        self.logger.log(f"[✓] {log_summary}")
         self._set_last_action("Manifest verified")
 
     def _on_passes_changed(self, value: int):
@@ -2916,20 +2955,46 @@ class SecureDeleteGUI(QWidget):
 
 import time
 
+# The `VerificationWorker` class performs manifest verification on a background thread.
+class VerificationWorker(QObject):
+    log = Signal(str)
+    finished = Signal(list)
+
+    def __init__(self, db_manager: LogDatabaseManager):
+        super().__init__()
+        self.db_manager = db_manager
+
+    def run(self):
+        class BridgeLogger:
+             def __init__(self, signal): self.signal = signal
+             def log(self, text): self.signal.emit(text)
+             
+        bridge = BridgeLogger(self.log)
+        results = verify_manifest_deletions(self.db_manager, bridge)
+        self.finished.emit(results)
+
+
 # The `DeleteWorker` class in Python defines a worker object that performs secure file deletion with
 # specified passes and emits signals for logging and completion with a unique wipe job ID.
 class DeleteWorker(QObject):
     log = Signal(str)
-    finished = Signal(bool, str, str) # Added wipe_job_id to signal
+    # finished(success, message, wipe_job_id, mcp_logs)
+    finished = Signal(bool, str, str, list)
 
-    def __init__(self, target: str, passes: int, db_manager: LogDatabaseManager, wipe_job_id: str):
+    def __init__(self, target: str, passes: int, db_manager: LogDatabaseManager,
+                 mcp_orchestrator, wipe_job_id: str = ""):
         super().__init__()
         self.target = Path(target)
         self.passes = int(passes)
         self.db_manager = db_manager
+        self.mcp_orchestrator = mcp_orchestrator
         self.wipe_job_id = wipe_job_id
         self._log_buffer = []
         self._last_emit_time = time.time()
+        # Results populated by run()
+        self.assessment_result = None
+        self.skipped = False  # True when user intervention needed (MANUAL_REVIEW etc.)
+        self.skip_reason = ""
 
     def _emit(self, message: str):
         self._log_buffer.append(message)
@@ -2939,17 +3004,76 @@ class DeleteWorker(QObject):
             self._log_buffer.clear()
             self._last_emit_time = now
 
-    def _append_manifest_entry(self, abs_path: Path, sha256: str):
-        self.db_manager.add_entry(abs_path, sha256)
+    def _flush_log(self):
+        if self._log_buffer:
+            self.log.emit("\n".join(self._log_buffer))
+            self._log_buffer.clear()
 
     def run(self):
-        def finished_emitter(success, message):
-            if self._log_buffer:
-                self.log.emit("\n".join(self._log_buffer))
-                self._log_buffer.clear()
-            self.finished.emit(success, message, self.wipe_job_id)
+        """Full lifecycle: assess → start → purge → verify, all on worker thread."""
+        mcp_logs = []
+        try:
+            # ── Phase 1: Assess asset (ML prediction, disk info, metrics) ──
+            self._emit(f"[MCP] Assessing asset: {self.target}")
+            self.assessment_result = self.mcp_orchestrator.assess_asset(self.target, self.passes)
+            mcp_logs = self.assessment_result.get("mcp_logs", [])
+            predicted_label = self.assessment_result["result"]["predicted_label"]
+            self.wipe_job_id = self.assessment_result["result"]["wipe_job_id"]
 
-        _perform_secure_purge_logic(self.target, self.passes, self.db_manager, self._emit, finished_emitter, self.wipe_job_id)
+            # Check if user intervention is needed — signal back without proceeding
+            if predicted_label == "MANUAL_REVIEW":
+                self.skipped = True
+                self.skip_reason = f"MANUAL_REVIEW: {self.assessment_result['result']['explain']}"
+                self._emit(f"[MCP] Manual review recommended for {self.target}: {self.assessment_result['result']['explain']}")
+                self._flush_log()
+                self.finished.emit(False, self.skip_reason, self.wipe_job_id, mcp_logs)
+                return
+
+            if self.assessment_result["result"]["method"] == "physical_destroy":
+                self.skipped = True
+                self.skip_reason = f"PHYSICAL_DESTROY: Multi-party approval required for {self.target}"
+                self._emit(f"[MCP] {self.skip_reason}")
+                self._flush_log()
+                self.finished.emit(False, self.skip_reason, self.wipe_job_id, mcp_logs)
+                return
+
+            # ── Phase 2: Start wipe job ──
+            if not self.mcp_orchestrator.start_wipe(self.wipe_job_id):
+                self._emit(f"[MCP-ERR] Failed to start wipe job {self.wipe_job_id}")
+                self._flush_log()
+                self.finished.emit(False, f"Failed to start wipe job {self.wipe_job_id}", self.wipe_job_id, mcp_logs)
+                return
+
+            # ── Phase 3: Perform the actual secure purge ──
+            purge_success = False
+            purge_message = ""
+
+            def finished_callback(success, message):
+                nonlocal purge_success, purge_message
+                purge_success = success
+                purge_message = message
+
+            _perform_secure_purge_logic(
+                self.target, self.passes, self.db_manager,
+                self._emit, finished_callback, self.wipe_job_id
+            )
+
+            # ── Phase 4: Verify wipe and generate certificates (heavy PDF work) ──
+            actual_result = "SUCCESS" if purge_success else "FAILURE"
+            verification_artifact = f"VerificationArtifact_{uuid.uuid4()}"
+            self.mcp_orchestrator.verify_wipe(
+                self.wipe_job_id, verification_artifact, True, actual_result
+            )
+
+            self._flush_log()
+            self.finished.emit(purge_success, purge_message, self.wipe_job_id, mcp_logs)
+
+        except Exception as e:
+            self._emit(f"[ERR] Worker exception: {e}")
+            import traceback
+            self._emit(traceback.format_exc())
+            self._flush_log()
+            self.finished.emit(False, f"Worker error: {e}", self.wipe_job_id, mcp_logs)
 
 
 # The `PhysicalDeviceWipeWorker` class performs secure wiping of physical devices on different
@@ -2959,11 +3083,13 @@ class PhysicalDeviceWipeWorker(QObject):
     log = Signal(str)
     finished = Signal(bool, str, str) # Added wipe_job_id to signal
 
-    def __init__(self, device_path: str, passes: int, wipe_job_id: str, logger: ConsoleLogger, is_system_wipe: bool = False):
+    def __init__(self, device_path: str, passes: int, wipe_job_id: str,
+                 mcp_orchestrator, logger: ConsoleLogger, is_system_wipe: bool = False):
         super().__init__()
         self.device_path = device_path
         self.passes = passes
         self.wipe_job_id = wipe_job_id
+        self.mcp_orchestrator = mcp_orchestrator
         self.logger = logger # Use the console logger for worker internal logs
         self.is_system_wipe = is_system_wipe # Whether this is a full system wipe
 
@@ -3053,9 +3179,15 @@ class PhysicalDeviceWipeWorker(QObject):
             import traceback
             self._emit_log(traceback.format_exc())
         
+        # Generate certificate for physical wipe on the worker thread (heavy PDF work)
+        if success:
+            try:
+                self._emit_log(f"Generating certificates for physical wipe: {self.wipe_job_id}")
+                self.mcp_orchestrator._generate_and_store_certificates(self.wipe_job_id)
+            except Exception as e:
+                self._emit_log(f"Certificate generation failed: {e}")
+
         # Store result for system wipe tracking
         self.last_result = (success, message)
-        # Emit completion signal
-        self.finished.emit(success, message, self.wipe_job_id)
-
+        # Emit completion signal once
         self.finished.emit(success, message, self.wipe_job_id)

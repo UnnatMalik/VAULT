@@ -4,7 +4,12 @@ import hashlib
 import platform
 import psutil
 from pathlib import Path
-from datetime import datetime, timezone, UTC
+from datetime import datetime, timezone
+try:
+    from datetime import UTC
+except ImportError:
+    # Python < 3.11 fallback
+    UTC = timezone.utc
 from typing import Optional, Dict, Any, List, Tuple, Union, Callable
 import sqlite3
 import json
@@ -5411,16 +5416,16 @@ def initialize_application():
                 import keybert
                 from sentence_transformers import SentenceTransformer
                 import spacy
+                from content_analyzer import ensure_sensitive_info_component
 
                 # Load spaCy model and ensure custom pipeline is available
                 nlp = spacy.load("en_core_web_sm", disable=["textcat", "ner"])
                 ensure_sensitive_info_component(nlp)
 
                 # Warm up heavy models so first-run latency is hidden from the GUI thread
-                SentenceTransformer('all-MiniLM-L6-v2')
-                keybert.KeyBERT()
+                _get_content_analyzer()
 
-                logger.info("NLP models loaded successfully")
+                logger.info("NLP models and ContentAnalyzer loaded successfully")
             except Exception as e:
                 logger.error(f"Error loading NLP models: {e}")
         
@@ -5435,6 +5440,7 @@ def initialize_application():
         return False
 
 if __name__ == "__main__":
+    mp.freeze_support()  # Required for Windows multiprocessing support
     launch_gui = _is_gui_launch(sys.argv)
     if launch_gui:
         suppress_console_window_if_needed(sys.argv)

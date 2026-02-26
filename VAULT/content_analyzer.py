@@ -7,34 +7,92 @@ import hashlib
 import json
 import time
 import multiprocessing as mp
-import chardet
-import fitz  # PyMuPDF for PDF processing
-import magic  # For better file type detection
-import pytesseract
-import numpy as np
-import pandas as pd
-import spacy
-import torch
-import numpy as np
 from typing import Dict, List, Tuple, Optional, Any, Set, Union, BinaryIO, Callable
 from pathlib import Path
 from enum import Enum, auto
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from collections import defaultdict
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import joblib
-import os
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ExifTags
-from keybert import KeyBERT
-from sentence_transformers import SentenceTransformer
-from spacy.language import Language
-from spacy.tokens import Doc, Span
-from spacy.matcher import PhraseMatcher
+
+# ---------------------------------------------------------------------------
+# Optional / heavy third-party dependencies
+# Each is guarded so the module can still be imported (e.g. for ContentType)
+# even when not every package is installed.
+# ---------------------------------------------------------------------------
+
+try:
+    import chardet
+except ImportError:
+    chardet = None  # type: ignore[assignment]
+
+try:
+    import fitz  # PyMuPDF for PDF processing
+except ImportError:
+    fitz = None  # type: ignore[assignment]
+
+try:
+    import magic  # For better file type detection
+except ImportError:
+    magic = None  # type: ignore[assignment]
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None  # type: ignore[assignment]
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # type: ignore[assignment]
+
+try:
+    import spacy
+    from spacy.language import Language
+    from spacy.tokens import Doc, Span
+    from spacy.matcher import PhraseMatcher
+except ImportError:
+    spacy = None  # type: ignore[assignment]
+    Language = None  # type: ignore[assignment]
+    Doc = None  # type: ignore[assignment]
+    Span = None  # type: ignore[assignment]
+    PhraseMatcher = None  # type: ignore[assignment]
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.pipeline import Pipeline
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report
+except ImportError:
+    TfidfVectorizer = None  # type: ignore[assignment]
+    RandomForestClassifier = None  # type: ignore[assignment]
+    Pipeline = None  # type: ignore[assignment]
+    train_test_split = None  # type: ignore[assignment]
+    classification_report = None  # type: ignore[assignment]
+
+try:
+    import joblib
+except ImportError:
+    joblib = None  # type: ignore[assignment]
+
+try:
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ExifTags
+except ImportError:
+    Image = None  # type: ignore[assignment]
+    ImageEnhance = None  # type: ignore[assignment]
+    ImageFilter = None  # type: ignore[assignment]
+    ImageOps = None  # type: ignore[assignment]
+    ExifTags = None  # type: ignore[assignment]
+
+try:
+    from keybert import KeyBERT
+except ImportError:
+    KeyBERT = None  # type: ignore[assignment]
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None  # type: ignore[assignment]
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -115,16 +173,24 @@ class TextClassifier:
     def _load_or_initialize_model(self):
         """Load a pre-trained model or initialize a new one."""
         if self.model_path and os.path.exists(self.model_path):
-            try:
-                model_data = joblib.load(self.model_path)
-                self.model = model_data['model']
-                self.vectorizer = model_data['vectorizer']
-                self.label_encoder = model_data['label_encoder']
-                logger.info(f"Loaded text classification model from {self.model_path}")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load model from {self.model_path}: {e}")
+            if joblib is None:
+                logger.warning("joblib is not installed – cannot load saved model")
+            else:
+                try:
+                    model_data = joblib.load(self.model_path)
+                    self.model = model_data['model']
+                    self.vectorizer = model_data['vectorizer']
+                    self.label_encoder = model_data['label_encoder']
+                    logger.info(f"Loaded text classification model from {self.model_path}")
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to load model from {self.model_path}: {e}")
         
+        if TfidfVectorizer is None or RandomForestClassifier is None:
+            logger.warning("scikit-learn is not installed – text classifier will be unavailable")
+            self.label_encoder = {t.value: i for i, t in enumerate(ContentType)}
+            return
+
         # Initialize a new model
         self.vectorizer = TfidfVectorizer(
             max_features=5000,
@@ -326,21 +392,27 @@ class ContentAnalyzer:
         self._init_database()
         self._init_sensitive_patterns()
         # Initialize magic library with cross-platform compatibility
-        try:
-            # Try Unix/Linux/macOS version first
-            self.magic = magic.Magic(mime=True)
-            self._magic_type = 'unix'
-        except (TypeError, AttributeError):
-            # Fallback to Windows version
+        if magic is None:
+            self.magic = None
+            self._magic_type = 'fallback'
+            import mimetypes
+            self.mimetypes = mimetypes
+        else:
             try:
-                self.magic = magic.Magic()
-                self._magic_type = 'windows'
-            except Exception:
-                # If magic fails entirely, we'll use mimetypes as fallback
-                self.magic = None
-                self._magic_type = 'fallback'
-                import mimetypes
-                self.mimetypes = mimetypes
+                # Try Unix/Linux/macOS version first
+                self.magic = magic.Magic(mime=True)
+                self._magic_type = 'unix'
+            except (TypeError, AttributeError):
+                # Fallback to Windows version
+                try:
+                    self.magic = magic.Magic()
+                    self._magic_type = 'windows'
+                except Exception:
+                    # If magic fails entirely, we'll use mimetypes as fallback
+                    self.magic = None
+                    self._magic_type = 'fallback'
+                    import mimetypes
+                    self.mimetypes = mimetypes
     
     def _get_mime_type(self, file_path: Path) -> str:
         """Get MIME type using cross-platform compatible method."""
@@ -367,27 +439,43 @@ class ContentAnalyzer:
         Args:
             classifier_model_path: Optional path to a pre-trained text classification model
         """
+        # Set safe defaults so the class is usable even when packages are missing
+        self.nlp = None
+        self.text_classifier = None
+        self.keybert_model = None
+        self.sentence_model = None
+        self.phrase_matcher = None
+
         try:
             # Load NLP models
-            self.nlp = spacy.load(
-                "en_core_web_sm", 
-                disable=['textcat', 'ner']  # We'll use our own NER
-            )
+            if spacy is not None:
+                self.nlp = spacy.load(
+                    "en_core_web_sm", 
+                    disable=['textcat', 'ner']  # We'll use our own NER
+                )
+                # Add custom pipeline components
+                ensure_sensitive_info_component(self.nlp)
+            else:
+                logger.warning("spacy is not installed – NLP features will be unavailable")
             
             # Initialize text classifier with optional model path
             self.text_classifier = TextClassifier(model_path=classifier_model_path) if classifier_model_path else None
             
-            # Add custom pipeline components
-            ensure_sensitive_info_component(self.nlp)
-            
             # Initialize KeyBERT for keyword extraction
-            self.keybert_model = KeyBERT()
+            if KeyBERT is not None:
+                self.keybert_model = KeyBERT()
+            else:
+                logger.warning("keybert is not installed – keyword extraction will be unavailable")
             
             # Initialize sentence transformer for embeddings
-            self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            if SentenceTransformer is not None:
+                self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            else:
+                logger.warning("sentence-transformers is not installed – embeddings will be unavailable")
             
             # Initialize PhraseMatcher for pattern matching
-            self.phrase_matcher = PhraseMatcher(self.nlp.vocab)
+            if self.nlp is not None and PhraseMatcher is not None:
+                self.phrase_matcher = PhraseMatcher(self.nlp.vocab)
             
             # Initialize text classifier
             self.text_classifier = TextClassifier(classifier_model_path)
@@ -474,8 +562,9 @@ class ContentAnalyzer:
         ]
         
         # Add patterns to phrase matcher for NER
-        for pattern in self.sensitive_patterns:
-            self.phrase_matcher.add(pattern.name, None, self.nlp(pattern.pattern))
+        if self.phrase_matcher is not None and self.nlp is not None:
+            for pattern in self.sensitive_patterns:
+                self.phrase_matcher.add(pattern.name, None, self.nlp(pattern.pattern))
         
     def _init_database(self) -> None:
         """Initialize the SQLite database for caching analysis results."""
@@ -3172,8 +3261,12 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Error caching analysis: {e}")
 
-def ensure_sensitive_info_component(nlp: Language) -> None:
+def ensure_sensitive_info_component(nlp) -> None:
     """Add the sensitive info component to the pipeline if it's not already present."""
+    if Language is None or nlp is None:
+        # spacy is not installed – nothing to do
+        return
+
     if 'sensitive_info' in nlp.pipe_names:
         return
         
